@@ -4,15 +4,30 @@ app/workers/livekit_agent.py
 LiveKit Agent - runs as a SEPARATE PROCESS from the main uvicorn server.
 
 Start it with:
-    python -m app.workers.livekit_agent dev
+    python -m app.workers.livekit_agent start
 
-The agent connects to the LiveKit server, joins every new room, listens to
-the candidate's audio via STT, generates a response via the LLM, and
-speaks it back via TTS. Without an STT/LLM/TTS pipeline configured, the
-agent would join and subscribe to the candidate's audio but never publish
-any audio track of its own — which is exactly what produces "camera/mic
-work, but there's no sound": the human's local capture is fine, there is
-just no second audio track in the room to hear anything from.
+The agent connects to the LiveKit server, joins every dispatched room,
+listens to the candidate's audio via STT, generates a response via the
+LLM, and speaks it back via TTS. Without an STT/LLM/TTS pipeline
+configured, the agent would join and subscribe to the candidate's audio
+but never publish any audio track of its own — which is exactly what
+produces "camera/mic work, but there's no sound": the human's local
+capture is fine, there is just no second audio track in the room to hear
+anything from.
+
+The STT/LLM/TTS/VAD pipeline and interviewer persona live in
+app/agents/voice_agent.py (VoiceAgent) — pipeline stage 4 of the
+multi-agent interview pipeline (see app/agents/__init__.py and
+app/services/interview_pipeline.py). This file is the LiveKit worker
+process shell around it: connection lifecycle, job metadata, and worker
+registration.
+
+A job dispatched with metadata (the multi-agent pipeline's
+preparation_id — see app.services.interview_pipeline and
+POST /api/v1/interviews/start) briefs VoiceAgent with the CandidateSummary
+and questions DocumentAgent/QuestionnaireAgent already prepared. A job
+with no metadata (e.g. dispatched via the plain POST /sessions/start)
+falls back to VoiceAgent's base persona.
 
 Dependencies (already in requirements.txt):
     livekit-agents[deepgram,openai,elevenlabs,silero]~=1.0
@@ -20,9 +35,8 @@ Dependencies (already in requirements.txt):
 Required environment variables (this process reads them via os.environ,
 loaded from .env below — it does NOT go through app.core.config.settings
 since it's a separate process from the FastAPI app):
-    DEEPGRAM_API_KEY   - https://console.deepgram.com
-    OPENAI_API_KEY     - https://platform.openai.com
-    ELEVEN_API_KEY     - https://elevenlabs.io
+    OPENAI_API_KEY     - https://platform.openai.com  (STT + LLM)
+    ELEVEN_API_KEY     - https://elevenlabs.io          (TTS)
 """
 
 import asyncio
@@ -33,62 +47,54 @@ import sys
 from dotenv import load_dotenv
 
 # Must run before the plugin imports below: livekit-agents plugins read
-# their API keys straight out of os.environ (DEEPGRAM_API_KEY,
-# OPENAI_API_KEY, ELEVEN_API_KEY) at construction time. pydantic-settings
-# in app.core.config only populates its own Settings object from .env —
-# it never touches the real process environment — and this file runs as
-# its own separate process anyway, so nothing else would ever load .env
-# for it.
+# their API keys straight out of os.environ (OPENAI_API_KEY,
+# ELEVEN_API_KEY) at construction time. pydantic-settings in
+# app.core.config only populates its own Settings object from .env — it
+# never touches the real process environment — and this file runs as its
+# own separate process anyway, so nothing else would ever load .env for
+# it.
 load_dotenv()
 
 from livekit.agents import (
-    AgentSession,
-    Agent,
     AutoSubscribe,
     JobContext,
     JobExecutorType,
     WorkerOptions,
     cli,
 )
-from livekit.plugins import deepgram, elevenlabs, openai, silero
 
+from app.agents.voice_agent import VoiceAgent
+from app.schemas.agent_context import AgentContext
 from app.services.redis_service import redis_service
 
 logger = logging.getLogger(__name__)
 
-_REQUIRED_ENV_VARS = ("DEEPGRAM_API_KEY", "OPENAI_API_KEY", "ELEVEN_API_KEY")
+_REQUIRED_ENV_VARS = ("OPENAI_API_KEY", "ELEVEN_API_KEY")
 
 
-class InterviewerAgent(Agent):
-    """AI Interviewer agent — speaks via the STT/LLM/TTS pipeline configured on its AgentSession."""
-
-    def __init__(self, room_name: str) -> None:
-        super().__init__(instructions=(
-            "You are Aria, a professional and friendly AI interviewer. "
-            "Ask the candidate concise, relevant questions based on their "
-            "CV and the job description, listen carefully to their answers, "
-            "and follow up where appropriate."
-        ))
-        self._room_name = room_name
-
-    async def on_enter(self) -> None:
-        logger.info("InterviewerAgent entered room.")
-        # Written to Redis so the backend (a separate process) has some
-        # visibility into whether the AI side of an interview is actually
-        # up — see redis_service.set_agent_status and
-        # GET /sessions/{id}/agent-status.
-        await redis_service.set_agent_status(self._room_name, "connected")
-
-    async def on_exit(self) -> None:
-        logger.info("InterviewerAgent exited room.")
-        await redis_service.set_agent_status(self._room_name, "disconnected")
+async def _load_pipeline_context(job_metadata: str) -> AgentContext | None:
+    preparation_id = (job_metadata or "").strip()
+    if not preparation_id:
+        return None
+    try:
+        raw = await redis_service.get_pipeline_context(preparation_id)
+    except Exception as exc:
+        logger.error("Failed to load pipeline context %s: %s", preparation_id, exc)
+        return None
+    if not raw:
+        logger.warning(
+            "No pipeline context found for preparation_id %s (expired, or never prepared).", preparation_id
+        )
+        return None
+    return AgentContext.model_validate_json(raw)
 
 
 async def entrypoint(ctx: JobContext) -> None:
     """
-    Entry point for each interview room: connect, start the AgentSession
-    (STT -> LLM -> TTS, with VAD for turn-taking), wait for the actual
-    candidate to be in the room, then greet them.
+    Entry point for each interview room: connect, load the multi-agent
+    pipeline context if this job was dispatched with one, start the
+    VoiceAgent session (STT -> LLM -> TTS, with VAD for turn-taking), wait
+    for the actual candidate to be in the room, then greet them.
     """
     room_name = ctx.room.name
     logger.info("Agent joining room: %s", room_name)
@@ -97,12 +103,10 @@ async def entrypoint(ctx: JobContext) -> None:
     # would just cost bandwidth/CPU for tracks it never uses.
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
 
-    session = AgentSession(
-        stt=deepgram.STT(),
-        llm=openai.LLM(model="gpt-4o"),
-        tts=elevenlabs.TTS(),
-        vad=silero.VAD.load(),
-    )
+    context = await _load_pipeline_context(ctx.job.metadata)
+
+    voice_agent = VoiceAgent()
+    session = voice_agent.build_session()
 
     @session.on("error")
     def _on_session_error(ev) -> None:
@@ -117,7 +121,7 @@ async def entrypoint(ctx: JobContext) -> None:
         logger.error("AgentSession error in room %s (source=%s): %s", room_name, ev.source, detail)
         asyncio.create_task(redis_service.set_agent_status(room_name, "degraded", detail=detail))
 
-    await session.start(agent=InterviewerAgent(room_name=room_name), room=ctx.room)
+    await session.start(agent=voice_agent.build_agent(room_name, context=context), room=ctx.room)
 
     # The agent can finish connecting and starting faster than the
     # candidate's own client does (dispatch is near-instant; a phone/app

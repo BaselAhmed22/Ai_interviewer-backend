@@ -5,6 +5,7 @@ import httpx
 import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from google.auth.exceptions import GoogleAuthError
 from google.auth.transport import requests as google_auth_requests
 from google.oauth2 import id_token as google_id_token
 from passlib.context import CryptContext
@@ -37,16 +38,6 @@ def _base_claims() -> dict:
 def create_access_token(user_id: str) -> str:
     expire = datetime.now(timezone.utc) + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     payload = {**_base_claims(), "sub": user_id, "type": "access", "exp": expire}
-    return jwt.encode(payload, settings.SECRET_KEY, algorithm="HS256")
-
-
-def create_refresh_token(user_id: str) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
-    # jti lets a specific refresh token be revoked (logout) without
-    # touching every other token issued to the user — otherwise a leaked
-    # refresh token stays usable for its full 7-day lifetime with no way
-    # to cut it off early short of rotating SECRET_KEY for everyone.
-    payload = {**_base_claims(), "sub": user_id, "type": "refresh", "jti": uuid.uuid4().hex, "exp": expire}
     return jwt.encode(payload, settings.SECRET_KEY, algorithm="HS256")
 
 
@@ -89,11 +80,6 @@ def decode_user_id(token: str) -> str:
     return _decode_token(token, expected_type="access")
 
 
-def decode_refresh_token(token: str) -> tuple[str, str]:
-    payload = _decode_token_payload(token, expected_type="refresh")
-    return payload["sub"], payload["jti"]
-
-
 def create_password_reset_token(user_id: str) -> str:
     expire = datetime.now(timezone.utc) + timedelta(
         minutes=settings.PASSWORD_RESET_TOKEN_EXPIRE_MINUTES
@@ -131,6 +117,15 @@ def verify_google_id_token(token: str) -> dict:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"code": "invalid_google_token", "message": "Google sign-in token is invalid or expired."},
+        ) from exc
+    except GoogleAuthError as exc:
+        # Raised when verify_oauth2_token can't even reach Google to fetch
+        # its signing certs (network blip, DNS failure, Google outage) —
+        # not a ValueError, so it wasn't caught above and used to escape
+        # as an unhandled 500 instead of a clean, retryable response.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "google_unreachable", "message": "Could not reach Google right now. Please try again."},
         ) from exc
 
 

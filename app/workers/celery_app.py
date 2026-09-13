@@ -32,5 +32,13 @@ celery_app.conf.update(
             "task": "reconcile_missing_reports",
             "schedule": 300.0,  # every 5 minutes
         },
+        "fail-stale-sessions": {
+            "task": "fail_stale_sessions",
+            "schedule": 600.0,  # every 10 minutes
+        },
+        "cleanup-expired-refresh-tokens": {
+            "task": "cleanup_expired_refresh_tokens",
+            "schedule": 86400.0,  # once a day
+        },
     },
 )

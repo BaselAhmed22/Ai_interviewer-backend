@@ -8,17 +8,22 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Coroutine
 
 from celery.signals import worker_process_init, worker_process_shutdown
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from sqlalchemy.exc import IntegrityError
 
 from app.workers.celery_app import celery_app
+from app.core.config import settings
 from app.core.database import AsyncSessionLocal, engine
 from app.db.models.session import InterviewSession, SessionStatus
 from app.db.models.report import InterviewReport
 from app.db.models.user import CandidateProfile
 from app.services.cv_parser import extract_text_from_file, CorruptFileError
+from app.db.models.refresh_token import RefreshToken
+from app.agents.evaluation_agent import EvaluationAgent
 
 logger = logging.getLogger(__name__)
+
+evaluation_agent = EvaluationAgent()
 
 
 def _backoff_countdown(retries: int, base: float = 10.0) -> float:
@@ -97,14 +102,10 @@ def generate_final_interview_report(self, session_id: str, audio_file_path: str 
     logger.info("Starting post-processing for session %s", session_id)
     time.sleep(5)  # Simulate AI processing — replace with the real scoring pipeline
 
-    report_metrics = {
-        "overall_score": 88.5,
-        "eye_contact_score": 90.0,
-        "posture_score": 85.0,
-        "speech_clarity_score": 90.5,
-        "feedback_summary": "Great overall performance with stable body posture and strong eye contact.",
-        "is_placeholder": True,
-    }
+    # EvaluationAgent (app/agents/evaluation_agent.py) holds the actual
+    # scoring logic — this task owns retries/durability/writing the
+    # result to InterviewReport, not the evaluation itself.
+    report_metrics = evaluation_agent.evaluate(session_id)
 
     async def save_to_db():
         async with AsyncSessionLocal() as db:
@@ -232,3 +233,49 @@ def reconcile_missing_reports(stale_after_minutes: int = 10) -> dict:
         generate_final_interview_report.delay(session_id)
 
     return {"reconciled": len(stale_session_ids)}
+
+
+@celery_app.task(name="fail_stale_sessions")
+def fail_stale_sessions() -> dict:
+    """Closes out IN_PROGRESS sessions abandoned for too long (dropped
+    connection, closed tab, ...) so the candidate isn't permanently blocked
+    from starting a new one by the one-active-session-per-user constraint."""
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=settings.STALE_SESSION_TIMEOUT_MINUTES)
+
+    async def fail_stale() -> int:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(InterviewSession).where(
+                    InterviewSession.status == SessionStatus.IN_PROGRESS,
+                    InterviewSession.created_at < cutoff,
+                )
+            )
+            sessions = result.scalars().all()
+            for session_obj in sessions:
+                session_obj.status = SessionStatus.FAILED
+                session_obj.failure_reason = "Session timed out due to inactivity."
+            await db.commit()
+            return len(sessions)
+
+    failed = run_async(fail_stale())
+    if failed:
+        logger.warning("Closed %d stale IN_PROGRESS session(s) past the %d-minute timeout.",
+                        failed, settings.STALE_SESSION_TIMEOUT_MINUTES)
+    return {"failed": failed}
+
+
+@celery_app.task(name="cleanup_expired_refresh_tokens")
+def cleanup_expired_refresh_tokens() -> dict:
+    """Deletes refresh_tokens rows past their expires_at (see celery_app.py's beat_schedule)."""
+    cutoff = datetime.now(timezone.utc)
+
+    async def delete_expired() -> int:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(delete(RefreshToken).where(RefreshToken.expires_at < cutoff))
+            await db.commit()
+            return result.rowcount
+
+    deleted = run_async(delete_expired())
+    if deleted:
+        logger.info("Cleaned up %d expired refresh token(s).", deleted)
+    return {"deleted": deleted}

@@ -3,7 +3,6 @@ import asyncio
 import logging
 import uuid
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
@@ -104,92 +103,81 @@ async def start_session(
     db: AsyncSession = Depends(get_db),
     user_id: str = Depends(get_current_user_id),
 ):
-    # JWT "sub" arrives as a plain string — convert to a real UUID object
-    # once, up front, before it touches any UUID-typed column. Comparing
-    # or inserting a raw str against InterviewSession.user_id /
-    # CandidateProfile.user_id / JobDescription.user_id (all UUID columns)
-    # is what was causing the 500s on this endpoint.
-    user_uuid = uuid.UUID(user_id)
-
-    # Raises the appropriate HTTPException itself if this user isn't
-    # ready to start (already active, no CV, CV failed, no job
-    # description) — see app/services/session_service.py.
-    await session_service.ensure_ready_to_start(db, user_uuid)
-
-    session_id = uuid.uuid4()
-    # The full UUID, not a truncated prefix: 8 hex chars is only 32 bits
-    # of entropy, and this name is the sole isolation boundary between one
-    # candidate's interview room and every other concurrent one — a
-    # collision there means two different interviews sharing one LiveKit
-    # room (crossed audio/video, wrong participants). The full UUID's
-    # collision probability is astronomically lower.
-    room_name = f"room_{session_id}"
-
-    # Generate the LiveKit token *before* creating the DB row. If this were
-    # done after the commit and it failed, the session would be stuck in
-    # IN_PROGRESS forever with no valid token ever returned — and the
-    # "session already active" check above would then permanently block
-    # this user from ever starting a new interview.
     try:
-        livekit_token = livekit_service.generate_token(room_name=room_name, participant_identity=user_id)
-    except Exception as exc:
-        logger.error("LiveKit token generation failed for user %s: %s", user_id, exc)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={"code": "livekit_unavailable", "message": "Could not start the interview session. Please try again."},
+        # JWT "sub" arrives as a plain string — convert to a real UUID object
+        # once, up front, before it touches any UUID-typed column. Comparing
+        # or inserting a raw str against InterviewSession.user_id /
+        # CandidateProfile.user_id / JobDescription.user_id (all UUID columns)
+        # is what was causing the 500s on this endpoint.
+        user_uuid = uuid.UUID(user_id)
+
+        # Raises the appropriate HTTPException itself if this user isn't
+        # ready to start (incomplete profile, already active, no CV, CV
+        # failed, no job description) — see app/services/session_service.py.
+        await session_service.ensure_ready_to_start(db, user_uuid)
+
+        session_id = uuid.uuid4()
+        room_name = session_service.build_room_name(session_id)
+
+        # Generate the LiveKit token *before* creating the DB row. If this
+        # were done after the commit and it failed, the session would be
+        # stuck in IN_PROGRESS forever with no valid token ever returned —
+        # and the "session already active" check above would then
+        # permanently block this user from ever starting a new interview.
+        try:
+            livekit_token = livekit_service.generate_token(room_name=room_name, participant_identity=user_id)
+        except Exception as exc:
+            logger.error("LiveKit token generation failed for user %s: %s", user_id, exc)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "livekit_unavailable", "message": "Could not start the interview session. Please try again."},
+            )
+
+        new_session = await session_service.create_active_session(db, user_uuid, session_id=session_id)
+
+        # Dispatched only now that the session row is durably committed —
+        # dispatching before commit could hand the agent a room for a
+        # session that then fails to persist (e.g. loses the same-user race
+        # above), leaving it waiting alone in a room nobody will ever join.
+        #
+        # Run as a background task rather than awaited here: dispatch_agent
+        # includes a short liveness check (does a worker actually pick the
+        # job up) that takes a couple of seconds by design — worth the wait
+        # for an accurate log, not worth making the candidate's token
+        # response wait for it. Same "best-effort" spirit as the
+        # report-generation dispatch in end_session: a dispatch problem
+        # (LiveKit unreachable, no worker connected) gets logged loudly,
+        # but doesn't block the candidate from getting their token and
+        # joining the room — automatic server-side dispatch, if configured,
+        # can still pick it up independently.
+        background_tasks.add_task(_dispatch_agent_and_log, room_name, session_id)
+
+        return SessionStartResponse(
+            id=str(new_session.id),
+            user_id=str(new_session.user_id),
+            room_name=new_session.room_name,
+            status=new_session.status.value,
+            livekit_token=livekit_token,
+            livekit_server_url=settings.LIVEKIT_URL,
+            interviewer_title="AI Interview Specialist",
+            total_questions=5,
         )
-
-    new_session = InterviewSession(
-        id=session_id,
-        user_id=user_uuid,
-        room_name=room_name,
-        status=SessionStatus.IN_PROGRESS,
-    )
-    db.add(new_session)
-    try:
-        await db.commit()
-    except IntegrityError:
-        # Two near-simultaneous /sessions/start calls can both pass the
-        # SELECT check above before either commits. The partial unique
-        # index (one IN_PROGRESS row per user) is the real guard — this
-        # turns that race into the same clean 409 the pre-check already
-        # gives, instead of an unhandled 500.
-        await db.rollback()
+    except HTTPException:
+        raise
+    except Exception:
+        # Anything not already turned into a clean HTTPException above
+        # (a bad LiveKit key format, a DB/schema mismatch, ...) — log the
+        # full traceback here, with the user_id this failed for, instead of
+        # letting the client see a bare 500 with no way to trace it back to
+        # a specific request in the server log.
+        logger.exception("Unexpected error in POST /sessions/start for user %s", user_id)
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={
-                "code": "session_already_active",
-                "message": "You already have an interview session in progress.",
+                "code": "session_start_failed",
+                "message": "Could not start the interview session due to an unexpected server error.",
             },
         )
-    await db.refresh(new_session)
-
-    # Dispatched only now that the session row is durably committed —
-    # dispatching before commit could hand the agent a room for a session
-    # that then fails to persist (e.g. loses the same-user race above),
-    # leaving it waiting alone in a room nobody will ever join.
-    #
-    # Run as a background task rather than awaited here: dispatch_agent
-    # includes a short liveness check (does a worker actually pick the job
-    # up) that takes a couple of seconds by design — worth the wait for an
-    # accurate log, not worth making the candidate's token response wait
-    # for it. Same "best-effort" spirit as the report-generation dispatch
-    # in end_session: a dispatch problem (LiveKit unreachable, no worker
-    # connected) gets logged loudly, but doesn't block the candidate from
-    # getting their token and joining the room — automatic server-side
-    # dispatch, if configured, can still pick it up independently.
-    background_tasks.add_task(_dispatch_agent_and_log, room_name, session_id)
-
-    return SessionStartResponse(
-        id=str(new_session.id),
-        user_id=str(new_session.user_id),
-        room_name=new_session.room_name,
-        status=new_session.status.value,
-        livekit_token=livekit_token,
-        livekit_server_url=settings.LIVEKIT_URL,
-        interviewer_title="AI Interview Specialist",
-        total_questions=5,
-    )
 
 
 @router.post("/{session_id}/reconnect-token", response_model=ReconnectTokenResponse)

@@ -20,9 +20,21 @@ class Settings(BaseSettings):
     # anyone forge valid JWTs for any user if SECRET_KEY is ever left
     # unset in an environment. Missing it must be a hard startup failure.
     SECRET_KEY: str
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
-    REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+    # Short-lived on purpose: an access token can't be revoked before it
+    # expires (it's a stateless JWT, checked by signature alone) — 15
+    # minutes bounds how long a leaked one stays useful. Session
+    # continuity beyond that is the refresh token's job, not this one's.
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
     PASSWORD_RESET_TOKEN_EXPIRE_MINUTES: int = 30
+
+    # Refresh-token rotation with token families — see
+    # app/services/token_service.py and app/db/models/refresh_token.py.
+    REFRESH_TOKEN_ABSOLUTE_EXPIRE_DAYS: int = 30
+    REFRESH_TOKEN_GRACE_PERIOD_SECONDS: int = 5
+    REFRESH_TOKEN_COOKIE_NAME: str = "refresh_token"
+    # Must be True in production (HTTPS-only) or browsers won't honor
+    # Secure and the cookie protection this design relies on is void.
+    COOKIE_SECURE: bool = False
 
     # Checked on every decode alongside the signature — a token signed
     # with the right SECRET_KEY but minted for a different audience (a
@@ -57,6 +69,13 @@ class Settings(BaseSettings):
 
     MAX_CV_UPLOAD_SIZE_BYTES: int = 10 * 1024 * 1024  # 10 MB
     UPLOAD_DIR: Path = BASE_DIR / "uploads" / "cvs"
+
+    # If a candidate's connection drops mid-interview and they never call
+    # /sessions/end, the session would otherwise stay IN_PROGRESS forever —
+    # and the one-active-session-per-user constraint then locks them out of
+    # starting a new one. fail_stale_sessions (celery_app.py's beat_schedule)
+    # closes out anything left open this long.
+    STALE_SESSION_TIMEOUT_MINUTES: int = 45
 
     # Password-reset delivery. Left empty, forgot_password() falls back to
     # printing the link to the console (dev only) — set all four to send
@@ -103,6 +122,16 @@ class Settings(BaseSettings):
     DEEPGRAM_API_KEY: str = ""
     OPENAI_API_KEY: str = ""
     ELEVEN_API_KEY: str = ""
+
+    # Which concrete provider class VoiceAgent (app/agents/voice_agent.py)
+    # asks app.core.providers.factory for, per role. No vendor is final
+    # yet — changing a provider is meant to be exactly this: flip the
+    # name here (and register the class in factory.py if it's new), never
+    # a code change in VoiceAgent, the LiveKit worker, or any other agent.
+    STT_PROVIDER: str = "openai"
+    LLM_PROVIDER: str = "openai"
+    TTS_PROVIDER: str = "elevenlabs"
+    LLM_MODEL: str = "gpt-4o-mini"
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=True)
 

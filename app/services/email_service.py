@@ -1,6 +1,6 @@
-# Email delivery for the password-reset flow. Uses stdlib smtplib (no new
-# dependency) run off the event loop via asyncio.to_thread, since smtplib
-# is a blocking socket client.
+# Email delivery for password resets and security alerts. Uses stdlib
+# smtplib, run off the event loop via asyncio.to_thread since it's a
+# blocking socket client.
 import asyncio
 import logging
 import smtplib
@@ -29,29 +29,30 @@ def _send_sync(to_email: str, subject: str, body: str) -> None:
         smtp.send_message(message)
 
 
-async def send_password_reset_email(to_email: str, reset_link: str) -> bool:
-    """
-    Returns True if a real email was sent, False if SMTP isn't configured
-    (caller should fall back to the dev-mode console print in that case).
-    Raises nothing on delivery failure — a bad SMTP config must not break
-    the password-reset flow's anti-enumeration guarantee (always 200
-    regardless of whether the email exists or whether delivery worked).
-    """
+async def _send(to_email: str, subject: str, body: str, log_label: str) -> bool:
     if not is_configured():
         return False
+    try:
+        await asyncio.wait_for(asyncio.to_thread(_send_sync, to_email, subject, body), timeout=15.0)
+        return True
+    except Exception as exc:
+        logger.error("Failed to send %s email to %s: %s", log_label, to_email, exc)
+        return False
 
-    subject = "Reset your IntervYou password"
+
+async def send_password_reset_email(to_email: str, reset_link: str) -> bool:
+    """Returns False if SMTP isn't configured; caller falls back to a console print."""
     body = (
         f"We received a request to reset your IntervYou password.\n\n"
         f"Reset it here: {reset_link}\n\n"
         f"If you didn't request this, you can safely ignore this email."
     )
-    try:
-        await asyncio.wait_for(
-            asyncio.to_thread(_send_sync, to_email, subject, body),
-            timeout=15.0,
-        )
-        return True
-    except Exception as exc:
-        logger.error("Failed to send password-reset email to %s: %s", to_email, exc)
+    return await _send(to_email, "Reset your IntervYou password", body, "password-reset")
+
+
+async def send_security_alert_email(to_email: str, message: str) -> bool:
+    """Sent by token_service when a refresh-token reuse attack is detected."""
+    if not is_configured():
+        logger.warning("[DEV] Security alert for %s (SMTP not configured): %s", to_email, message)
         return False
+    return await _send(to_email, "Security alert: unusual activity on your account", message, "security-alert")

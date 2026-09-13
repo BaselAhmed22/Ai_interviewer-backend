@@ -12,7 +12,7 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.core.security import get_current_user_id
 from app.db.models.user import CandidateProfile, JobDescription, InterviewPreference
-from app.services.candidate_service import deactivate_active_records
+from app.services.candidate_service import save_as_active_record
 from app.services.cv_parser import resolve_cv_path
 from app.workers.tasks import process_cv_analysis
 from app.schemas.candidate import (
@@ -94,17 +94,17 @@ async def upload_cv(
         )
 
     try:
-        await deactivate_active_records(db, CandidateProfile, user_uuid)
-
-        profile = CandidateProfile(
-            user_id=user_uuid,
-            cv_file_path=str(file_path),
-            original_filename=file.filename,
-            is_active=True,
+        profile = await save_as_active_record(
+            db,
+            CandidateProfile,
+            user_uuid,
+            lambda: CandidateProfile(
+                user_id=user_uuid,
+                cv_file_path=str(file_path),
+                original_filename=file.filename,
+                is_active=True,
+            ),
         )
-        db.add(profile)
-        await db.commit()
-        await db.refresh(profile)
     except Exception:
         # The file already landed on disk before any DB row was created
         # to reference it. If the transaction fails, remove it instead of
@@ -173,17 +173,17 @@ async def add_job_description(
 ):
     user_uuid = uuid.UUID(user_id)
 
-    await deactivate_active_records(db, JobDescription, user_uuid)
-
-    job = JobDescription(
-        user_id=user_uuid,
-        job_title=payload.job_title,
-        description_text=payload.description_text,
-        is_active=True,
+    job = await save_as_active_record(
+        db,
+        JobDescription,
+        user_uuid,
+        lambda: JobDescription(
+            user_id=user_uuid,
+            job_title=payload.job_title,
+            description_text=payload.description_text,
+            is_active=True,
+        ),
     )
-    db.add(job)
-    await db.commit()
-    await db.refresh(job)
 
     return JobDescriptionResponse(message="Job Description saved successfully", job_id=str(job.id))
 
@@ -196,19 +196,19 @@ async def save_interview_preferences(
 ):
     user_uuid = uuid.UUID(user_id)
 
-    await deactivate_active_records(db, InterviewPreference, user_uuid)
-
-    pref = InterviewPreference(
-        user_id=user_uuid,
-        company_name=payload.company_name,
-        job_title=payload.job_title,
-        language=payload.language,
-        interview_date=payload.interview_date,
-        is_active=True,
+    pref = await save_as_active_record(
+        db,
+        InterviewPreference,
+        user_uuid,
+        lambda: InterviewPreference(
+            user_id=user_uuid,
+            company_name=payload.company_name,
+            job_title=payload.job_title,
+            language=payload.language,
+            interview_date=payload.interview_date,
+            is_active=True,
+        ),
     )
-    db.add(pref)
-    await db.commit()
-    await db.refresh(pref)
 
     return InterviewPreferenceResponse(
         message="Interview preferences saved successfully", preference_id=str(pref.id)

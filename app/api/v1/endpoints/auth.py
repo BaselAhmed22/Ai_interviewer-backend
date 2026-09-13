@@ -1,8 +1,11 @@
 # app/api/v1/endpoints/auth.py
 import asyncio
 import logging
+import uuid
+from datetime import datetime, timezone
+from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from redis.exceptions import RedisError
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,25 +17,27 @@ from app.core.rate_limiter import (
     enforce_login_rate_limit,
     enforce_registration_rate_limit,
     enforce_password_reset_rate_limit,
+    get_client_ip,
 )
 from app.core.security import (
     hash_password,
     verify_password,
     create_access_token,
-    create_refresh_token,
-    decode_refresh_token,
     create_password_reset_token,
     decode_password_reset_token,
     verify_google_id_token,
     verify_google_access_token,
+    get_current_user_id,
 )
-from app.db.models.user import User
-from app.services import email_service
+from app.db.models.user import User, is_profile_complete
+from app.services import email_service, token_service
 from app.services.redis_service import redis_service
+from app.services.token_service import IssuedToken
 from app.schemas.auth import (
     RegisterRequest,
     LoginRequest,
     RefreshRequest,
+    CompleteProfileRequest,
     TokenResponse,
     UserResponse,
     AuthResponse,
@@ -45,6 +50,44 @@ from app.schemas.auth import (
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+_REFRESH_COOKIE_PATH = f"{settings.API_V1_STR}/auth"
+
+
+def _set_refresh_cookie(response: Response, issued: IssuedToken) -> None:
+    max_age = max(0, int((issued.expires_at - datetime.now(timezone.utc)).total_seconds()))
+    response.set_cookie(
+        key=settings.REFRESH_TOKEN_COOKIE_NAME,
+        value=issued.raw_token,
+        httponly=True,
+        secure=settings.COOKIE_SECURE,
+        samesite="strict",
+        path=_REFRESH_COOKIE_PATH,
+        max_age=max_age,
+    )
+
+
+def _clear_refresh_cookie(response: Response) -> None:
+    response.delete_cookie(
+        key=settings.REFRESH_TOKEN_COOKIE_NAME,
+        path=_REFRESH_COOKIE_PATH,
+        httponly=True,
+        secure=settings.COOKIE_SECURE,
+        samesite="strict",
+    )
+
+
+def _extract_refresh_token(request: Request, payload: Optional[RefreshRequest]) -> str:
+    # Cookie takes precedence over the body for web clients.
+    cookie_value = request.cookies.get(settings.REFRESH_TOKEN_COOKIE_NAME)
+    if cookie_value:
+        return cookie_value
+    if payload and payload.refresh_token:
+        return payload.refresh_token
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail={"code": "missing_refresh_token", "message": "No refresh token provided."},
+    )
 
 
 async def _enforce_account_lockout(email: str) -> None:
@@ -81,6 +124,15 @@ def _user_to_response(user: User) -> UserResponse:
         role=user.role,
         plan=user.plan,
         initials=initials or None,
+        first_name=user.first_name,
+        last_name=user.last_name,
+        phone_country_code=user.phone_country_code,
+        phone_number=user.phone_number,
+        university=user.university,
+        faculty=user.faculty,
+        is_graduate=user.is_graduate,
+        graduation_year=user.graduation_year,
+        is_profile_complete=is_profile_complete(user),
     )
 
 
@@ -90,7 +142,7 @@ def _user_to_response(user: User) -> UserResponse:
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(enforce_registration_rate_limit)],
 )
-async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db)):
+async def register(payload: RegisterRequest, request: Request, response: Response, db: AsyncSession = Depends(get_db)):
     existing = await db.execute(select(User).where(User.email == payload.email))
     if existing.scalars().first():
         raise HTTPException(
@@ -102,6 +154,14 @@ async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db))
         email=payload.email,
         hashed_password=hash_password(payload.password),
         full_name=payload.full_name,
+        first_name=payload.first_name,
+        last_name=payload.last_name,
+        phone_country_code=payload.phone_country_code.value if payload.phone_country_code else None,
+        phone_number=payload.phone_number,
+        university=payload.university,
+        faculty=payload.faculty,
+        is_graduate=payload.is_graduate,
+        graduation_year=payload.graduation_year,
     )
     db.add(user)
     try:
@@ -118,15 +178,22 @@ async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db))
         )
     await db.refresh(user)
 
+    issued = await token_service.issue_new_family(
+        db, user.id, get_client_ip(request), request.headers.get("user-agent")
+    )
+    _set_refresh_cookie(response, issued)
+
     token = TokenResponse(
         access_token=create_access_token(str(user.id)),
-        refresh_token=create_refresh_token(str(user.id)),
+        refresh_token=issued.raw_token,
     )
     return AuthResponse(token=token, user=_user_to_response(user))
 
 
 @router.post("/login", response_model=AuthResponse, dependencies=[Depends(enforce_login_rate_limit)])
-async def login(payload: LoginRequest, request: Request, db: AsyncSession = Depends(get_db)):
+async def login(
+    payload: LoginRequest, request: Request, response: Response, db: AsyncSession = Depends(get_db)
+):
     await _enforce_account_lockout(payload.email)
 
     result = await db.execute(select(User).where(User.email == payload.email))
@@ -152,9 +219,14 @@ async def login(payload: LoginRequest, request: Request, db: AsyncSession = Depe
     except RedisError:
         logger.warning("Redis unavailable — could not reset login rate-limit counters for user %s.", user.id)
 
+    issued = await token_service.issue_new_family(
+        db, user.id, get_client_ip(request), request.headers.get("user-agent")
+    )
+    _set_refresh_cookie(response, issued)
+
     token = TokenResponse(
         access_token=create_access_token(str(user.id)),
-        refresh_token=create_refresh_token(str(user.id)),
+        refresh_token=issued.raw_token,
     )
     return AuthResponse(token=token, user=_user_to_response(user))
 
@@ -178,7 +250,9 @@ async def google_config():
     response_model=AuthResponse,
     dependencies=[Depends(enforce_login_rate_limit)],
 )
-async def google_auth(payload: GoogleAuthRequest, db: AsyncSession = Depends(get_db)):
+async def google_auth(
+    payload: GoogleAuthRequest, request: Request, response: Response, db: AsyncSession = Depends(get_db)
+):
     """
     Verify a Google credential from the Flutter app — either an OIDC
     id_token or an OAuth access_token, whichever that platform's Google
@@ -212,7 +286,12 @@ async def google_auth(payload: GoogleAuthRequest, db: AsyncSession = Depends(get
             # unreachable Google endpoint must not stall this coroutine
             # indefinitely.
             idinfo = await asyncio.to_thread(verify_google_id_token, payload.id_token)
-        except HTTPException:
+        except HTTPException as exc:
+            # 503 (Google itself unreachable) is its own distinct, already-
+            # correct response — only a genuinely invalid/expired token
+            # should fall through to the generic 400 below.
+            if exc.status_code == status.HTTP_503_SERVICE_UNAVAILABLE:
+                raise
             idinfo = None
     elif payload.access_token:
         try:
@@ -279,63 +358,99 @@ async def google_auth(payload: GoogleAuthRequest, db: AsyncSession = Depends(get
         else:
             await db.refresh(user)
 
+    issued = await token_service.issue_new_family(
+        db, user.id, get_client_ip(request), request.headers.get("user-agent")
+    )
+    _set_refresh_cookie(response, issued)
+
     token = TokenResponse(
         access_token=create_access_token(str(user.id)),
-        refresh_token=create_refresh_token(str(user.id)),
+        refresh_token=issued.raw_token,
     )
     return AuthResponse(token=token, user=_user_to_response(user))
 
 
+@router.get("/me", response_model=UserResponse)
+async def get_me(user_id: str = Depends(get_current_user_id), db: AsyncSession = Depends(get_db)):
+    """Current user's profile, including isProfileComplete — lets the app
+    re-check completion status on every cold start without another login."""
+    result = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
+    user = result.scalars().first()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"code": "user_not_found", "message": "User not found."})
+    return _user_to_response(user)
+
+
+@router.patch("/profile", response_model=UserResponse)
+async def complete_profile(
+    payload: CompleteProfileRequest, user_id: str = Depends(get_current_user_id), db: AsyncSession = Depends(get_db)
+):
+    """Fills in the mandatory profile fields (first/last name, education,
+    phone) a Google sign-in doesn't collect on its own — required before
+    starting an interview session (see session_service.ensure_ready_to_start)."""
+    result = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
+    user = result.scalars().first()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"code": "user_not_found", "message": "User not found."})
+
+    user.first_name = payload.first_name
+    user.last_name = payload.last_name
+    user.phone_country_code = payload.phone_country_code.value
+    user.phone_number = payload.phone_number
+    user.university = payload.university
+    user.faculty = payload.faculty
+    user.is_graduate = payload.is_graduate
+    user.graduation_year = payload.graduation_year if payload.is_graduate else None
+    await db.commit()
+    await db.refresh(user)
+
+    return _user_to_response(user)
+
+
 @router.post("/refresh", response_model=TokenResponse)
-async def refresh(payload: RefreshRequest, db: AsyncSession = Depends(get_db)):
-    user_id, jti = decode_refresh_token(payload.refresh_token)
+async def refresh(
+    request: Request,
+    response: Response,
+    payload: Optional[RefreshRequest] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Rotates the refresh token (see app.services.token_service)."""
+    raw_token = _extract_refresh_token(request, payload)
 
-    # Revocation is a defense-in-depth check on top of an already
-    # signature-verified, non-expired token. If Redis is unreachable we
-    # cannot confirm revocation either way — fail open (treat as not
-    # revoked) rather than blocking every token refresh in the app during
-    # a Redis outage that has nothing to do with this user's credentials.
-    try:
-        revoked = await redis_service.is_refresh_token_revoked(jti)
-    except RedisError:
-        logger.warning("Redis unavailable — skipping refresh-token revocation check for user %s.", user_id)
-        revoked = False
+    issued = await token_service.rotate_refresh_token(
+        db, raw_token, get_client_ip(request), request.headers.get("user-agent")
+    )
 
-    if revoked:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"code": "token_revoked", "message": "This session has been logged out."},
-        )
-
-    result = await db.execute(select(User).where(User.id == user_id))
+    result = await db.execute(select(User).where(User.id == issued.user_id))
     if not result.scalars().first():
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"code": "user_not_found", "message": "User no longer exists."},
         )
 
+    _set_refresh_cookie(response, issued)
+
     return TokenResponse(
-        access_token=create_access_token(user_id),
-        refresh_token=create_refresh_token(user_id),
+        access_token=create_access_token(str(issued.user_id)),
+        refresh_token=issued.raw_token,
     )
 
 
 @router.post("/logout", response_model=MessageResponse)
-async def logout(payload: RefreshRequest):
-    # Revoking is best-effort keyed off the refresh token's own jti — an
-    # already-invalid/expired token has nothing to revoke, so treat that
-    # as a no-op rather than an error; the caller's intent (end this
-    # session) is already satisfied either way.
-    try:
-        _, jti = decode_refresh_token(payload.refresh_token)
-    except HTTPException:
-        return MessageResponse(message="Logged out.")
+async def logout(
+    request: Request,
+    response: Response,
+    payload: Optional[RefreshRequest] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Revokes every token in the family and clears the refresh cookie."""
+    cookie_value = request.cookies.get(settings.REFRESH_TOKEN_COOKIE_NAME)
+    raw_token = cookie_value or (payload.refresh_token if payload else None)
 
-    try:
-        await redis_service.revoke_refresh_token(jti, ttl=settings.REFRESH_TOKEN_EXPIRE_DAYS * 86400)
-    except RedisError:
-        logger.warning("Redis unavailable — could not persist refresh-token revocation for jti %s.", jti)
+    if raw_token:
+        await token_service.revoke_family_by_token(db, raw_token)
 
+    _clear_refresh_cookie(response)
     return MessageResponse(message="Logged out.")
 
 

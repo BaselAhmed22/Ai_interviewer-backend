@@ -44,13 +44,15 @@ class RedisService:
         await self.connect()
         return bool(await self.redis.exists(f"used-reset-token:{jti}"))
 
-    async def revoke_refresh_token(self, jti: str, ttl: int) -> None:
+    async def cache_refresh_rotation(self, old_token_hash: str, payload_json: str, ttl: int) -> None:
+        # Grace-period cache for refresh-token rotation, keyed by the old
+        # token's hash — see token_service.rotate_refresh_token.
         await self.connect()
-        await self.redis.set(f"revoked-refresh-token:{jti}", "1", ex=ttl)
+        await self.redis.set(f"refresh-rotation:{old_token_hash}", payload_json, ex=ttl)
 
-    async def is_refresh_token_revoked(self, jti: str) -> bool:
+    async def get_cached_refresh_rotation(self, old_token_hash: str) -> str | None:
         await self.connect()
-        return bool(await self.redis.exists(f"revoked-refresh-token:{jti}"))
+        return await self.redis.get(f"refresh-rotation:{old_token_hash}")
 
     async def set_agent_status(
         self, room_name: str, status: str, detail: str | None = None, ttl: int = 90
@@ -72,5 +74,20 @@ class RedisService:
         await self.connect()
         data = await self.redis.hgetall(f"agent-status:{room_name}")
         return data or None
+
+    async def save_pipeline_context(self, preparation_id: str, context_json: str, ttl: int = 6 * 3600) -> None:
+        # The working state of one multi-agent interview pipeline run
+        # (see app.schemas.agent_context.AgentContext /
+        # app.services.interview_pipeline.InterviewPipelineManager).
+        # Deliberately ephemeral (6h TTL) — this is scratch state for one
+        # interview attempt, not a durable record; the interview itself
+        # lives in the InterviewSession/InterviewReport tables regardless
+        # of whether this key has expired.
+        await self.connect()
+        await self.redis.set(f"pipeline-context:{preparation_id}", context_json, ex=ttl)
+
+    async def get_pipeline_context(self, preparation_id: str) -> str | None:
+        await self.connect()
+        return await self.redis.get(f"pipeline-context:{preparation_id}")
 
 redis_service = RedisService()

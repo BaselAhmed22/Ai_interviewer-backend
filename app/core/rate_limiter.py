@@ -9,7 +9,7 @@ from app.services.redis_service import redis_service
 logger = logging.getLogger(__name__)
 
 
-def _get_client_ip(request: Request) -> str:
+def get_client_ip(request: Request) -> str:
     # Behind a reverse proxy or tunnel (Ngrok, Nginx, a load balancer —
     # this project's own docs mention Ngrok specifically), request.client
     # is the proxy's socket, not the real caller. Without this, every user
@@ -23,7 +23,7 @@ def _get_client_ip(request: Request) -> str:
 
 def _build_rate_limiter(action: str, max_attempts: int, window_seconds: int):
     async def dependency(request: Request) -> None:
-        client_ip = _get_client_ip(request)
+        client_ip = get_client_ip(request)
         key = f"rate-limit:{action}:{client_ip}"
         # Stashed so the endpoint can clear this IP's counter on success —
         # otherwise unrelated failed attempts from a shared IP (NAT, office

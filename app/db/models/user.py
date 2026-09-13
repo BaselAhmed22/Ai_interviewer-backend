@@ -2,11 +2,12 @@
 import uuid
 from datetime import datetime
 from typing import Optional
-from sqlalchemy import String, Text, DateTime, Boolean, func
+from sqlalchemy import String, Text, DateTime, Boolean, Index, func, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy import ForeignKey
 from sqlalchemy.orm import Mapped, mapped_column
 from app.core.database import Base
+
 
 class User(Base):
     __tablename__ = "users"
@@ -19,6 +20,21 @@ class User(Base):
     # paths work from then on.
     hashed_password: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     full_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    first_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    last_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    # E.g. "+20" / "+966" — see app.schemas.auth._COUNTRY_PHONE_LENGTHS for
+    # the supported codes and the exact digit count each one requires.
+    phone_country_code: Mapped[Optional[str]] = mapped_column(String(5), nullable=True)
+    # National number only, digits with no country code/spaces/symbols.
+    phone_number: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    university: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    faculty: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # True = graduate, False = undergraduate, NULL = not provided.
+    is_graduate: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    # Only meaningful when is_graduate is True; left null for undergraduates.
+    graduation_year: Mapped[Optional[int]] = mapped_column(nullable=True)
+
     role: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     # Google's stable "sub" claim for this user. Unique + nullable: most
     # rows (password-only accounts) leave it null; a Google-authenticated
@@ -31,8 +47,33 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+# Mandatory profile fields — checked regardless of how the account was
+# created (password or Google), so a Google sign-in can't bypass the
+# same requirement a password registration is also held to.
+_REQUIRED_PROFILE_FIELDS = (
+    "first_name", "last_name", "is_graduate", "university", "faculty",
+    "phone_country_code", "phone_number",
+)
+
+
+def is_profile_complete(user: "User") -> bool:
+    if any(getattr(user, field) is None for field in _REQUIRED_PROFILE_FIELDS):
+        return False
+    if user.is_graduate and user.graduation_year is None:
+        return False
+    return True
+
+
 class CandidateProfile(Base):
     __tablename__ = "candidate_profiles"
+    __table_args__ = (
+        Index(
+            "ux_candidate_profiles_one_active_per_user",
+            "user_id",
+            unique=True,
+            postgresql_where=text("is_active = true"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
@@ -53,6 +94,14 @@ class CandidateProfile(Base):
 
 class JobDescription(Base):
     __tablename__ = "job_descriptions"
+    __table_args__ = (
+        Index(
+            "ux_job_descriptions_one_active_per_user",
+            "user_id",
+            unique=True,
+            postgresql_where=text("is_active = true"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
@@ -64,6 +113,14 @@ class JobDescription(Base):
 
 class InterviewPreference(Base):
     __tablename__ = "interview_preferences"
+    __table_args__ = (
+        Index(
+            "ux_interview_preferences_one_active_per_user",
+            "user_id",
+            unique=True,
+            postgresql_where=text("is_active = true"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)

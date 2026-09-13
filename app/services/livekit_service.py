@@ -29,7 +29,7 @@ class LiveKitService:
 
         return token.to_jwt()
 
-    async def dispatch_agent(self, room_name: str) -> None:
+    async def dispatch_agent(self, room_name: str, metadata: str | None = None) -> None:
         """
         Explicitly tell the LiveKit server to send the interviewer agent
         (app/workers/livekit_agent.py, registered under LIVEKIT_AGENT_NAME)
@@ -39,6 +39,14 @@ class LiveKitService:
         multiple interviews can be starting at the same moment, where
         "eventually notices" is exactly the kind of race that leaves one
         candidate's room without an agent.
+
+        `metadata`, when given, is the multi-agent pipeline's
+        preparation_id (see app.services.interview_pipeline) — the agent
+        worker reads it back off the job (ctx.job.metadata) to load the
+        AgentContext DocumentAgent/QuestionnaireAgent prepared and brief
+        VoiceAgent with it. Left None for callers that dispatch without
+        going through the pipeline (e.g. plain /sessions/start), in which
+        case the agent falls back to its base persona.
         """
         client = api.LiveKitAPI(
             url=settings.LIVEKIT_URL,
@@ -50,6 +58,7 @@ class LiveKitService:
                 api.CreateAgentDispatchRequest(
                     agent_name=settings.LIVEKIT_AGENT_NAME,
                     room=room_name,
+                    metadata=metadata or "",
                 )
             )
 

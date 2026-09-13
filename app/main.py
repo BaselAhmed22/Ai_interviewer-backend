@@ -151,15 +151,20 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
 async def unhandled_exception_handler(request: Request, exc: Exception):
     # Last-resort net: anything that reaches here is either a bug or an
     # infrastructure outage (Redis/Postgres unreachable) that no
-    # individual endpoint chose to handle specially. Both used to collapse
-    # into the same generic 500 — logged identically — making it
-    # impossible to tell "the DB is down" from "there's a bug" by
-    # response shape alone. A connection-level failure to a dependency we
-    # don't control is a 503, not a 500.
+    # individual endpoint chose to handle specially. A connection-level
+    # failure to a dependency we don't control is a 503, not a 500 — and
+    # is logged with which dependency failed up front, before the full
+    # traceback, so "Postgres is unreachable" vs "Redis is unreachable"
+    # vs "there's a bug" is obvious at a glance in the terminal instead of
+    # having to read the whole stack trace to find the driver error.
+    if isinstance(exc, DBAPIError):
+        logger.error("Database unreachable or query failed: %s", exc)
+    elif isinstance(exc, RedisError):
+        logger.error("Redis unreachable: %s", exc)
     logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
 
     if isinstance(exc, RedisError) or isinstance(exc, DBAPIError):
-        return JSONResponse(
+        response = JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             content={
                 "error": {
@@ -169,17 +174,33 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
                 }
             },
         )
+    else:
+        response = JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "error": {
+                    "code": "internal_error",
+                    "message": "An unexpected error occurred. Please try again.",
+                    "details": None,
+                }
+            },
+        )
 
-    return JSONResponse(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={
-            "error": {
-                "code": "internal_error",
-                "message": "An unexpected error occurred. Please try again.",
-                "details": None,
-            }
-        },
-    )
+    # This handler runs in Starlette's ServerErrorMiddleware, which sits
+    # OUTSIDE (above) CORSMiddleware — so a response built here never
+    # passes back through CORSMiddleware and would otherwise reach the
+    # browser with no Access-Control-Allow-Origin header at all. A
+    # browser-based client (Flutter web included) then can't read the
+    # response body or status — it just sees an opaque CORS/network
+    # failure, hiding the real 500/503 and message from the app entirely.
+    # Every other exception handler in this file (RequestValidationError,
+    # StarletteHTTPException) runs inside ExceptionMiddleware, which is
+    # nested inside CORSMiddleware, so only this one needs the header
+    # added by hand. Matches this app's actual CORS policy below
+    # (wildcard origin, no credentials) — update both together if that
+    # policy ever changes.
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    return response
 
 
 @app.get("/", tags=["Health"])
