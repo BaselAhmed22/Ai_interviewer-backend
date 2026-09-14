@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     PASSWORD_RESET_TOKEN_EXPIRE_MINUTES: int = 30
 
     # Refresh-token rotation with token families — see
-    # app/services/token_service.py and app/db/models/refresh_token.py.
+    # app/auth/services/token_service.py and app/auth/models.py.
     REFRESH_TOKEN_ABSOLUTE_EXPIRE_DAYS: int = 30
     REFRESH_TOKEN_GRACE_PERIOD_SECONDS: int = 5
     REFRESH_TOKEN_COOKIE_NAME: str = "refresh_token"
@@ -102,7 +102,7 @@ class Settings(BaseSettings):
     SIMLI_API_KEY: str = ""
     SIMLI_FACE_ID: str = ""
 
-    # Which concrete provider class app.core.providers.factory returns
+    # Which concrete provider class app.interviews.providers.factory returns
     # per role — switching vendors is a config change here, not a code
     # change in VoiceAgent (new vendors still need a class registered in
     # factory.py).
@@ -115,6 +115,16 @@ class Settings(BaseSettings):
     # run in-process in this app (not the separate LiveKit worker), so this
     # one is read through Settings directly.
     GEMINI_API_KEY: str = ""
+
+    # Comma-separated emails. Registering (password or Google) with one of
+    # these is auto-approved and made an admin — the only way to create the
+    # first admin, since there's no one to approve them otherwise.
+    ADMIN_EMAILS: str = ""
+
+    # Free-tier cap on AI-generated interviews per user (POST
+    # /interviews/prepare) — see app.interviews.api.pipeline. Admins
+    # bypass this.
+    FREE_INTERVIEW_ATTEMPTS: int = 3
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=True)
 

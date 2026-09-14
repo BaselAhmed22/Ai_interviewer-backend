@@ -19,7 +19,7 @@ from alembic import context
 # Alembic has no way of knowing it exists.
 # --------------------------------------------------------------------------
 from app.core.config import settings
-from app.db.base import Base  # noqa: F401  (import side effect registers all models)
+from app.core.db_registry import Base  # noqa: F401  (import side effect registers all models)
 
 config = context.config
 

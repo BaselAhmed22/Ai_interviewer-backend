@@ -34,7 +34,7 @@ PROCESSES = [
     ("FastAPI server", [PYTHON, "-m", "app.main"]),
     ("Celery worker", [CELERY, "-A", "app.workers.celery_app", "worker", "--loglevel=info", "--pool=solo"]),
     ("Celery beat", [CELERY, "-A", "app.workers.celery_app", "beat", "--loglevel=info"]),
-    ("LiveKit agent", [PYTHON, "-m", "app.workers.livekit_agent", "start"]),
+    ("LiveKit agent", [PYTHON, "-m", "app.interviews.workers.livekit_agent", "start"]),
 ]
 
 if __name__ == "__main__":

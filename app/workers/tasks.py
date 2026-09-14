@@ -13,12 +13,12 @@ from sqlalchemy.exc import IntegrityError
 from app.workers.celery_app import celery_app
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal, engine
-from app.db.models.session import InterviewSession, SessionStatus
-from app.db.models.report import InterviewReport
-from app.db.models.user import CandidateProfile
-from app.services.cv_parser import extract_text_from_file, CorruptFileError
-from app.db.models.refresh_token import RefreshToken
-from app.agents.evaluation_agent import EvaluationAgent
+from app.interviews.models.session import InterviewSession, SessionStatus
+from app.interviews.models.report import InterviewReport
+from app.candidates.models import CandidateProfile
+from app.candidates.services.cv_parser import extract_text_from_file, CorruptFileError
+from app.auth.models import RefreshToken
+from app.ai_evaluator.evaluation_agent import EvaluationAgent
 
 logger = logging.getLogger(__name__)
 

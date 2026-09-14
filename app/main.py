@@ -12,8 +12,8 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.core.config import settings
 from app.core.database import engine
-from app.api.v1.router import api_router
-from app.services.redis_service import redis_service
+from app.api.router import api_router
+from app.core.redis_service import redis_service
 
 # Python's root logger defaults to WARNING with no handler attached, and
 # uvicorn's own logging config only sets up its "uvicorn"/"uvicorn.access"

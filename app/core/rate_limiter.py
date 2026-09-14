@@ -4,7 +4,7 @@ from fastapi import HTTPException, Request, status
 from redis.exceptions import RedisError
 
 from app.core.config import settings
-from app.services.redis_service import redis_service
+from app.core.redis_service import redis_service
 
 logger = logging.getLogger(__name__)
 

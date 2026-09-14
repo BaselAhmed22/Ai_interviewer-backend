@@ -172,8 +172,8 @@ celery -A app.workers.celery_app beat --loglevel=info
 — without this running, a candidate joins an empty room):
 
 ```bash
-python -m app.workers.livekit_agent start   # production
-python -m app.workers.livekit_agent dev     # local dev, verbose logs
+python -m app.interviews.workers.livekit_agent start   # production
+python -m app.interviews.workers.livekit_agent dev     # local dev, verbose logs
 ```
 
 This process reads `DEEPGRAM_API_KEY`, `OPENAI_API_KEY`, and

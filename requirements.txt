@@ -25,3 +25,4 @@ google-auth
 google-genai
 requests
 httpx
+python-dotenv
