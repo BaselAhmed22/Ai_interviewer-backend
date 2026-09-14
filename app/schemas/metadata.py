@@ -1,4 +1,3 @@
-# app/schemas/metadata.py
 from typing import Optional
 from pydantic import Field
 from app.schemas.base import CamelModel

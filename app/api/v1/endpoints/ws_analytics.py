@@ -1,6 +1,3 @@
-# Real-time WebSocket Endpoint — now also owns the alert-threshold logic
-# that used to live in the standalone services/alert_engine.py (see the
-# merge rationale in section 2 above: single consumer, no reuse elsewhere).
 import asyncio
 import json
 import logging
@@ -103,12 +100,9 @@ async def analytics_websocket(websocket: WebSocket, session_id: str, token: str 
     frames_in_window = 0
     try:
         while True:
-            # The ownership/IN_PROGRESS check only ran once, at connect
-            # time. If the session is ended via POST /sessions/end/{id}
-            # from another tab/device while this socket stays open, it
-            # kept streaming and writing Redis counters for a session
-            # that's already COMPLETED in the DB, with nothing to notice
-            # or close it. Re-check periodically instead of only once.
+            # Re-check periodically, not just at connect — otherwise a
+            # session ended from another tab/device would leave this
+            # socket streaming into a session already COMPLETED in the DB.
             now = time.time()
             if now - last_session_check >= SESSION_RECHECK_INTERVAL:
                 last_session_check = now
@@ -124,11 +118,8 @@ async def analytics_websocket(websocket: WebSocket, session_id: str, token: str 
             except asyncio.TimeoutError:
                 continue  # nothing arrived; loop back around to the re-check above
 
-            # Simple per-connection frame-rate cap — nothing bounded how
-            # fast a client could push frames, so a runaway/buggy sender
-            # could hammer Redis with no backpressure. Excess frames in
-            # the current window are dropped silently rather than
-            # forwarded to the alert engine.
+            # Per-connection frame-rate cap — drop excess frames instead
+            # of forwarding them, so a runaway sender can't hammer Redis.
             if now - window_start >= 1.0:
                 window_start = now
                 frames_in_window = 0
@@ -136,11 +127,8 @@ async def analytics_websocket(websocket: WebSocket, session_id: str, token: str 
             if frames_in_window > MAX_FRAMES_PER_SECOND:
                 continue
 
-            # A single malformed frame (bad JSON, a field out of range)
-            # used to take down the whole connection via the outer
-            # except below — forcing a full reconnect + re-auth handshake
-            # mid-interview. Skip just the bad frame instead; only a real
-            # connection-level failure should end the loop.
+            # Skip a malformed frame rather than let it fall through to the
+            # outer except and kill the connection over one bad message.
             try:
                 data_json = json.loads(data_text)
                 data_json["session_id"] = session_id

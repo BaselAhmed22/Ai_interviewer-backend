@@ -1,4 +1,3 @@
-# API Router Aggregator
 from fastapi import APIRouter
 from app.api.v1.endpoints import ws_analytics, sessions, auth, candidate, interview, interviews
 

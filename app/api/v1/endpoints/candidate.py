@@ -46,11 +46,8 @@ async def upload_cv(
             detail={"code": "unsupported_file_type", "message": "Only PDF and DOCX files are allowed."},
         )
 
-    # Read in bounded chunks and abort as soon as the running total crosses
-    # the limit, instead of buffering the whole upload into memory first
-    # and only then checking its size — a multi-hundred-MB body named
-    # "cv.pdf" would otherwise sit fully in RAM before ever being rejected,
-    # and concurrent oversized uploads compound that.
+    # Bounded chunks so an oversized upload is rejected before it's fully
+    # buffered into memory.
     chunk_size = 1024 * 1024
     max_size = settings.MAX_CV_UPLOAD_SIZE_BYTES
     buffer = bytearray()
@@ -76,11 +73,8 @@ async def upload_cv(
 
     file_extension = os.path.splitext(file.filename)[1].lower()
     unique_filename = f"{uuid.uuid4()}{file_extension}"
-    # Absolute path, stored as such in the DB below — FastAPI and the
-    # Celery worker are separate processes with independent working
-    # directories, so a relative path here would resolve differently (or
-    # not at all) depending on which directory each happened to be
-    # launched from.
+    # Absolute, since FastAPI and the Celery worker are separate processes
+    # with independent working directories.
     file_path = settings.UPLOAD_DIR / unique_filename
 
     try:
@@ -106,20 +100,17 @@ async def upload_cv(
             ),
         )
     except Exception:
-        # The file already landed on disk before any DB row was created
-        # to reference it. If the transaction fails, remove it instead of
-        # leaving an orphaned upload with nothing pointing to it.
+        # DB transaction failed after the file already landed on disk —
+        # remove it instead of leaving an orphaned upload.
         try:
             os.remove(file_path)
         except OSError:
             pass
         raise
 
-    # Same event-loop hazard as report generation in sessions.py: .delay()
-    # makes a real, synchronous network call to the broker. Isolate it in a
-    # thread with a hard timeout so a slow/dead broker can't stall this
-    # response — the CV is already saved either way, so dispatch failure is
-    # non-fatal and just gets logged.
+    # .delay() is a blocking network call — isolate it with a hard timeout
+    # so a slow/dead broker can't stall this response. The CV is already
+    # saved either way; dispatch failure is non-fatal, just logged.
     try:
         await asyncio.wait_for(
             asyncio.to_thread(process_cv_analysis.delay, str(profile.id)),

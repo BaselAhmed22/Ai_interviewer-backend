@@ -19,24 +19,27 @@ class PipelineStage(str, Enum):
 
 
 class CandidateSummary(BaseModel):
-    """DocumentAgent's output — a placeholder shape today (see
-    app/agents/document_agent.py). The AI team should extend this with
-    whatever structured fields real CV analysis produces, as long as
-    QuestionnaireAgent's input contract is updated alongside it."""
+    """DocumentAgent's output — real Gemini-based CV/job analysis (see
+    app/agents/document_agent.py)."""
 
     headline: Optional[str] = None
     key_skills: list[str] = []
     raw_cv_excerpt: Optional[str] = None
 
+    # required_skills lives here rather than on a separate job-side schema
+    # since it comes from the same CV-vs-job-description Gemini call.
+    experience: list[str] = []
+    projects: list[str] = []
+    required_skills: list[str] = []
+    matching_skills: list[str] = []
+    missing_skills: list[str] = []
+    profile: Optional[str] = None
+
 
 class AgentContext(BaseModel):
-    """The working state of one interview pipeline run, from `prepare`
-    through `evaluate`. Persisted to Redis (see
-    redis_service.save_pipeline_context/get_pipeline_context) keyed by
-    preparation_id — ephemeral working memory for one interview, not a
-    permanent record. The durable record of the interview itself lives in
-    the existing InterviewSession / InterviewReport tables, unaffected by
-    this context expiring."""
+    """Working state of one interview pipeline run, from `prepare` through
+    `evaluate`. Persisted to Redis, keyed by preparation_id — ephemeral;
+    the durable record lives in InterviewSession / InterviewReport."""
 
     preparation_id: str
     user_id: str

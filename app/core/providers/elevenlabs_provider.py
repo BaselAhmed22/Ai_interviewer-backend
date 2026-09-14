@@ -1,4 +1,3 @@
-# app/core/providers/elevenlabs_provider.py
 """Default TTS provider: ElevenLabs."""
 from livekit.plugins import elevenlabs as livekit_elevenlabs
 

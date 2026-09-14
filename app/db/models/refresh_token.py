@@ -1,4 +1,3 @@
-# app/db/models/refresh_token.py
 # Opaque, rotating refresh tokens grouped into families. See
 # app/services/token_service.py for the rotation and reuse-detection logic.
 import enum

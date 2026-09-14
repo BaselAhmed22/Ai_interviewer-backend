@@ -1,4 +1,3 @@
-# app/api/v1/endpoints/interviews.py
 """
 Multi-agent interview pipeline: DocumentAgent -> QuestionnaireAgent
 (prepare) -> ControllerAgent -> VoiceAgent (start) -> EvaluationAgent
@@ -12,6 +11,7 @@ the candidate summary and generated questions back (and a place to hand
 them to the voice agent) before the interview starts.
 """
 import asyncio
+import json
 import logging
 import uuid
 
@@ -55,7 +55,27 @@ async def prepare_interview(
 ):
     """Stage 1-2: run DocumentAgent then QuestionnaireAgent against the
     caller's active CV and job description, and persist the result."""
-    context = await interview_pipeline_manager.prepare(db, uuid.UUID(user_id))
+    try:
+        context = await interview_pipeline_manager.prepare(db, uuid.UUID(user_id))
+    except HTTPException:
+        raise
+    except RuntimeError as exc:
+        # GEMINI_API_KEY not configured — a deployment/config gap, not
+        # something the candidate can do anything about.
+        logger.error("Interview preparation misconfigured: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "ai_not_configured", "message": "Interview preparation is not available right now."},
+        )
+    except Exception:
+        # Gemini unreachable, quota exhausted, or returned something
+        # unusable — logged in full here so the actual cause is visible,
+        # the candidate just gets a clean, retryable response.
+        logger.exception("Interview preparation failed for user %s", user_id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "ai_generation_failed", "message": "Could not prepare the interview. Please try again."},
+        )
     return PrepareInterviewResponse(
         preparation_id=context.preparation_id,
         questions_count=len(context.questions),
@@ -100,10 +120,26 @@ async def start_interview_pipeline(
             detail={"code": "livekit_unavailable", "message": "Could not start the interview session. Please try again."},
         )
 
-    new_session = await session_service.create_active_session(db, user_uuid, session_id=session_id)
+    new_session = await session_service.create_active_session(
+        db,
+        user_uuid,
+        session_id=session_id,
+        questions=context.questions,
+        candidate_summary=context.candidate_summary.model_dump() if context.candidate_summary else None,
+    )
     context = await interview_pipeline_manager.mark_started(context, new_session.id)
 
-    background_tasks.add_task(_dispatch_agent_and_log, room_name, new_session.id, context.preparation_id)
+    # session_id/user_id travel alongside preparation_id (not just the
+    # bare preparation_id string as before) so the agent can fall back to
+    # the durable copy on the session row (questions + candidate_summary,
+    # persisted above) if the Redis pipeline context has expired or is
+    # otherwise unavailable by the time the job is picked up.
+    dispatch_metadata = json.dumps({
+        "preparation_id": context.preparation_id,
+        "session_id": str(new_session.id),
+        "user_id": user_id,
+    })
+    background_tasks.add_task(_dispatch_agent_and_log, room_name, new_session.id, dispatch_metadata)
 
     return StartPipelineResponse(
         session_id=str(new_session.id),

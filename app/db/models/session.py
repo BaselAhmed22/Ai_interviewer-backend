@@ -1,7 +1,8 @@
 import enum
 import uuid
 from datetime import datetime
-from sqlalchemy import DateTime, Enum, ForeignKey, Index, func, text
+from typing import Optional
+from sqlalchemy import DateTime, Enum, ForeignKey, Index, JSON, func, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.database import Base
@@ -14,11 +15,9 @@ class SessionStatus(str, enum.Enum):
 class InterviewSession(Base):
     __tablename__ = "interview_sessions"
     __table_args__ = (
-        # Enforces "at most one active session per user" at the database
-        # level. The app-level SELECT-then-INSERT check in start_session
-        # has a race window between two near-simultaneous requests; this
-        # index is the actual guarantee — a second concurrent insert hits
-        # this constraint and gets turned into the same 409 response.
+        # The real guarantee behind "one active session per user" — the
+        # app-level check in start_session has a race window a concurrent
+        # insert can hit; this index turns that into a 409, not a bypass.
         Index(
             "ux_interview_sessions_one_active_per_user",
             "user_id",
@@ -34,6 +33,14 @@ class InterviewSession(Base):
     room_name: Mapped[str] = mapped_column(nullable=False, unique=True)
     status: Mapped[SessionStatus] = mapped_column(Enum(SessionStatus), default=SessionStatus.IN_PROGRESS)
     failure_reason: Mapped[str | None] = mapped_column(nullable=True)
+    # The prepared question list, when this session went through the
+    # multi-agent pipeline (POST /interviews/start) — null for the plain
+    # /sessions/start path, which has no prepared questions.
+    questions: Mapped[Optional[list[str]]] = mapped_column(JSON, nullable=True)
+    # DocumentAgent's CV-vs-job analysis (see
+    # app.schemas.agent_context.CandidateSummary), persisted so it
+    # survives past the Redis pipeline context's TTL. Null, same as `questions`.
+    candidate_summary: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

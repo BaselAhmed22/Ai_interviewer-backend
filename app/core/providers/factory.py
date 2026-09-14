@@ -1,4 +1,3 @@
-# app/core/providers/factory.py
 """
 Picks a concrete provider class based on settings.STT_PROVIDER /
 LLM_PROVIDER / TTS_PROVIDER (.env-driven — see app/core/config.py)
@@ -10,19 +9,25 @@ agents) needs to change.
 """
 from app.core.config import settings
 from app.core.providers.base import LLMProvider, STTProvider, TTSProvider
+from app.core.providers.deepgram_provider import DeepgramSTTProvider
 from app.core.providers.elevenlabs_provider import ElevenLabsTTSProvider
+from app.core.providers.gemma_provider import GemmaLLMProvider
 from app.core.providers.openai_provider import OpenAILLMProvider, OpenAISTTProvider
+from app.core.providers.rime_provider import RimeTTSProvider
 
 _STT_PROVIDERS: dict[str, type[STTProvider]] = {
     "openai": OpenAISTTProvider,
+    "deepgram": DeepgramSTTProvider,
 }
 
 _LLM_PROVIDERS: dict[str, type[LLMProvider]] = {
     "openai": OpenAILLMProvider,
+    "gemma": GemmaLLMProvider,
 }
 
 _TTS_PROVIDERS: dict[str, type[TTSProvider]] = {
     "elevenlabs": ElevenLabsTTSProvider,
+    "rime": RimeTTSProvider,
 }
 
 

@@ -1,4 +1,3 @@
-# app/api/v1/endpoints/auth.py
 import asyncio
 import logging
 import uuid
@@ -91,11 +90,9 @@ def _extract_refresh_token(request: Request, payload: Optional[RefreshRequest]) 
 
 
 async def _enforce_account_lockout(email: str) -> None:
-    # Per-IP limiting (the dependency on this route) is blind to the same
-    # account being targeted from many different IPs — a botnet or proxy
-    # rotation spreads attempts thin enough that no single IP ever crosses
-    # the per-IP threshold. This is a second, independent counter keyed by
-    # the account itself, so the account is still protected either way.
+    # A second counter keyed by the account itself, independent of the
+    # per-IP limit on this route — catches a botnet/proxy rotation
+    # spreading attempts thin enough to stay under the per-IP threshold.
     try:
         attempts = await redis_service.increment_counter(
             f"account-lockout:{email}",
@@ -167,10 +164,8 @@ async def register(payload: RegisterRequest, request: Request, response: Respons
     try:
         await db.commit()
     except IntegrityError:
-        # Two concurrent registrations for the same email can both pass the
-        # SELECT check above and race to commit — the DB's unique constraint
-        # is the real guard; this turns that race into a clean 400 instead
-        # of an unhandled 500.
+        # Two concurrent registrations can both pass the SELECT above and
+        # race to commit — the DB's unique constraint is the real guard.
         await db.rollback()
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -199,20 +194,16 @@ async def login(
     result = await db.execute(select(User).where(User.email == payload.email))
     user = result.scalars().first()
 
-    # A Google-only account has no hashed_password (None) — verify_password
-    # would crash on that instead of failing cleanly, so it must short
-    # circuit here rather than fall through to the hash comparison.
+    # A Google-only account has no hashed_password — verify_password would
+    # crash on None, so short-circuit before the hash comparison.
     if not user or not user.hashed_password or not verify_password(payload.password, user.hashed_password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"code": "invalid_credentials", "message": "Incorrect email or password."},
         )
 
-    # A successful login clears this IP's and this account's failed-attempt
-    # counters, so past failures (e.g. from a shared/office IP, or a
-    # mistyped password a minute ago) don't count against the next
-    # legitimate attempt. If Redis is down this is a no-op — the login
-    # itself already succeeded and must not fail over a housekeeping step.
+    # Clear both counters so past failures don't count against future
+    # attempts. Redis being down here is a no-op, not a login failure.
     try:
         await redis_service.reset_counter(request.state.rate_limit_key)
         await redis_service.reset_counter(f"account-lockout:{payload.email}")
@@ -264,14 +255,10 @@ async def google_auth(
 
     if payload.id_token:
         if not settings.GOOGLE_CLIENT_ID:
-            # Without this, an empty GOOGLE_CLIENT_ID means
-            # verify_oauth2_token checks the token's "aud" claim against
-            # "" — which never matches a real token — so every attempt
-            # would fail with the same confusing "invalid token" error as
-            # an actually-forged one, with nothing pointing at the real
-            # cause (server misconfiguration, not a bad token). This only
-            # applies to the id_token path — the access_token path below
-            # asks Google directly and never checks GOOGLE_CLIENT_ID.
+            # An empty GOOGLE_CLIENT_ID would make verify_oauth2_token check
+            # "aud" against "", failing every real token with the same
+            # error as a forged one — fail loudly here instead. Only
+            # applies to id_token; access_token below asks Google directly.
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={
@@ -280,16 +267,12 @@ async def google_auth(
                 },
             )
         try:
-            # verify_oauth2_token fetches Google's certs over the network
-            # — off the event loop for the same reason as the Celery
-            # .delay() calls elsewhere in this codebase: a slow/
-            # unreachable Google endpoint must not stall this coroutine
-            # indefinitely.
+            # verify_oauth2_token fetches Google's certs over the network —
+            # off the event loop so a slow/unreachable Google can't stall it.
             idinfo = await asyncio.to_thread(verify_google_id_token, payload.id_token)
         except HTTPException as exc:
-            # 503 (Google itself unreachable) is its own distinct, already-
-            # correct response — only a genuinely invalid/expired token
-            # should fall through to the generic 400 below.
+            # 503 (Google unreachable) is already the right response —
+            # only a genuinely invalid token should fall through to 400.
             if exc.status_code == status.HTTP_503_SERVICE_UNAVAILABLE:
                 raise
             idinfo = None
@@ -312,10 +295,7 @@ async def google_auth(
         )
 
     google_id = idinfo["sub"]
-    # Preserved exactly as Google returns it — same case-preserving policy
-    # as password-based register/login, so this doesn't create a
-    # "third casing" of the same address that neither of those paths
-    # would ever produce or match against.
+    # Case preserved as-is, matching password register/login's policy.
     email = idinfo["email"].strip()
     name = idinfo.get("name")
 
@@ -327,10 +307,7 @@ async def google_auth(
         user = result.scalars().first()
 
         if user:
-            # Pre-existing password account with this exact email. Google
-            # has already proven the caller owns that email (that's what
-            # email_verified means), so linking here is the same trust
-            # level a brand-new signup gets — not a weaker one.
+            # Existing password account, same verified email — link it.
             user.google_id = google_id
         else:
             user = User(
@@ -344,9 +321,7 @@ async def google_auth(
         try:
             await db.commit()
         except IntegrityError:
-            # Two concurrent first-time Google sign-ins for the same
-            # account can both pass the SELECT checks above and race to
-            # commit — same shape as the /register race.
+            # Same race as /register: two concurrent first-time sign-ins.
             await db.rollback()
             result = await db.execute(select(User).where(User.google_id == google_id))
             user = result.scalars().first()
@@ -460,14 +435,9 @@ async def logout(
     dependencies=[Depends(enforce_password_reset_rate_limit)],
 )
 async def forgot_password(payload: ForgotPasswordRequest, db: AsyncSession = Depends(get_db)):
-    """
-    Generate a password reset token and email it — or, if SMTP isn't
-    configured (SMTP_HOST/USER/PASSWORD/FROM_EMAIL in .env), fall back to
-    printing the link to the console for local development.
-
-    Always returns 200 regardless of whether the email exists or whether
-    delivery succeeded — this prevents user enumeration attacks.
-    """
+    """Generate a password reset token and email it, or print the link to
+    the console if SMTP isn't configured. Always returns 200 regardless of
+    whether the email exists, to prevent user enumeration."""
     result = await db.execute(select(User).where(User.email == payload.email))
     user = result.scalars().first()
 
@@ -489,18 +459,12 @@ async def forgot_password(payload: ForgotPasswordRequest, db: AsyncSession = Dep
     dependencies=[Depends(enforce_password_reset_rate_limit)],
 )
 async def reset_password(payload: ResetPasswordRequest, db: AsyncSession = Depends(get_db)):
-    """
-    Validate the password-reset JWT and update the user's password.
-    """
+    """Validate the password-reset JWT and update the user's password."""
     user_id, jti = decode_password_reset_token(payload.token)
 
-    # Reject replays of an already-consumed reset link before it naturally
-    # expires — otherwise a link leaked once (email logs, browser history)
-    # stays exploitable for its whole validity window. Same fail-open
-    # policy as the other Redis-backed checks in this file: if Redis is
-    # down we can't confirm single-use either way, and blocking every
-    # password reset in the app over that is worse than the rare risk of
-    # a replay during an outage window.
+    # Reject replays of an already-used reset link. Fail-open if Redis is
+    # down, same as the other Redis-backed checks here — blocking every
+    # reset over that is worse than the rare replay risk during an outage.
     try:
         already_used = await redis_service.is_password_reset_token_used(jti)
     except RedisError:

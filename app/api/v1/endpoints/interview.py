@@ -1,4 +1,3 @@
-# app/api/v1/endpoints/interview.py
 import logging
 import uuid
 
@@ -22,21 +21,14 @@ async def start_interview(
     db: AsyncSession = Depends(get_db),
     user_id: str = Depends(get_current_user_id),
 ):
-    """
-    Join (or rejoin) the LiveKit room for an existing interview. The
-    interview/session itself must already exist — created via
-    POST /sessions/start, which is the step that actually sets up the
-    InterviewSession row, generates its room_name, and dispatches the AI
-    agent. This endpoint's job is narrower: verify the caller owns this
-    exact interview and it's still active, then hand back a fresh
-    LiveKit token for its room.
-    """
+    """Join (or rejoin) the LiveKit room for an interview already created
+    via POST /sessions/start. Verifies ownership and that it's still
+    active, then hands back a fresh token for its room."""
     try:
         session_uuid = uuid.UUID(payload.interview_id)
     except ValueError:
-        # Not a well-formed ID at all — same externally-visible outcome as
-        # "no such interview" rather than a 422, since interviewId is an
-        # opaque identifier from the frontend's point of view.
+        # A malformed ID reads as "no such interview," not a 422 — interviewId
+        # is an opaque identifier from the frontend's point of view.
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"code": "not_found", "message": "Interview not found."},
@@ -51,10 +43,6 @@ async def start_interview(
             detail={"code": "not_found", "message": "Interview not found."},
         )
     if str(session_obj.user_id) != user_id:
-        # Same 403 "forbidden" shape used for ownership checks everywhere
-        # else in this API (end_session, reconnect-token, session report)
-        # — kept consistent rather than introducing a different
-        # not-found-vs-forbidden convention for just this one endpoint.
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"code": "forbidden", "message": "Not your interview."},

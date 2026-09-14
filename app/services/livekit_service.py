@@ -1,4 +1,3 @@
-# LiveKit Server Integration
 import asyncio
 import logging
 
@@ -18,7 +17,6 @@ class LiveKitService:
         if participant_name:
             token.with_name(participant_name)
 
-        # Grant room permissions (join room & allow sending audio/video)
         grant = api.VideoGrants(
             room_join=True,
             room=room_name,
@@ -30,23 +28,15 @@ class LiveKitService:
         return token.to_jwt()
 
     async def dispatch_agent(self, room_name: str, metadata: str | None = None) -> None:
-        """
-        Explicitly tell the LiveKit server to send the interviewer agent
-        (app/workers/livekit_agent.py, registered under LIVEKIT_AGENT_NAME)
-        into this specific room right now, instead of relying on
-        server-side automatic dispatch to eventually notice the new room.
-        Explicit dispatch is deterministic and immediate — important once
-        multiple interviews can be starting at the same moment, where
-        "eventually notices" is exactly the kind of race that leaves one
-        candidate's room without an agent.
+        """Explicitly send the interviewer agent (app/workers/livekit_agent.py,
+        registered under LIVEKIT_AGENT_NAME) into this room now, rather than
+        waiting on server-side automatic dispatch — deterministic and
+        immediate, which matters when multiple interviews start at once.
 
-        `metadata`, when given, is the multi-agent pipeline's
-        preparation_id (see app.services.interview_pipeline) — the agent
-        worker reads it back off the job (ctx.job.metadata) to load the
-        AgentContext DocumentAgent/QuestionnaireAgent prepared and brief
-        VoiceAgent with it. Left None for callers that dispatch without
-        going through the pipeline (e.g. plain /sessions/start), in which
-        case the agent falls back to its base persona.
+        `metadata` is the JSON object the agent parses in
+        _parse_job_metadata (see app/workers/livekit_agent.py) to look up
+        prepared questions and greet the candidate by name. Left empty,
+        the agent falls back to its base persona.
         """
         client = api.LiveKitAPI(
             url=settings.LIVEKIT_URL,
@@ -62,16 +52,9 @@ class LiveKitService:
                 )
             )
 
-            # LiveKit *accepting* the dispatch only means it recorded the
-            # request — it says nothing about whether a worker is actually
-            # connected to fulfill it. Without this check, "no worker
-            # running" and "worker running fine" look identical from here:
-            # both return success, and the candidate only finds out
-            # something's wrong once they're already in an empty room
-            # ("No one else is in this room!"). A short wait gives the
-            # server a moment to match the job to a connected worker, then
-            # a job still showing no worker_id is a reliable, real-time
-            # "no live agent worker" signal — not a guess.
+            # LiveKit accepting the dispatch only means it recorded the
+            # request, not that a worker is connected to fulfill it. Give
+            # it a moment to match the job, then check worker_id directly.
             await asyncio.sleep(1.5)
             dispatches = await client.agent_dispatch.list_dispatch(room_name=room_name)
             picked_up = any(
@@ -94,16 +77,9 @@ class LiveKitService:
             await client.aclose()
 
     async def close_room(self, room_name: str) -> None:
-        """
-        Tear down a room on the LiveKit server once its interview is over.
-        Without this, ending a session on our side only updates our own
-        DB row — the room (and the agent process sitting in it, still
-        running STT/LLM/TTS) keeps existing on LiveKit until it times out
-        on its own, which means continued cost/resource use on an
-        interview that's already "finished" from the candidate's
-        perspective. Deleting the room disconnects every participant,
-        including the agent, immediately.
-        """
+        """Deletes the room, disconnecting every participant including the
+        agent — otherwise it keeps running STT/LLM/TTS until it times out
+        on its own, well after our DB already marks the session finished."""
         client = api.LiveKitAPI(
             url=settings.LIVEKIT_URL,
             api_key=settings.LIVEKIT_API_KEY,

@@ -1,5 +1,5 @@
-# app/api/v1/endpoints/sessions.py
 import asyncio
+import json
 import logging
 import uuid
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
@@ -18,6 +18,9 @@ from app.services.redis_service import redis_service
 from app.schemas.session import (
     SessionStartResponse,
     SessionListItem,
+    SessionResponse,
+    InterviewDetailResponse,
+    CandidateSummaryResponse,
     EndSessionResponse,
     ReconnectTokenRequest,
     ReconnectTokenResponse,
@@ -29,9 +32,9 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-async def _dispatch_agent_and_log(room_name: str, session_id: uuid.UUID) -> None:
+async def _dispatch_agent_and_log(room_name: str, session_id: uuid.UUID, metadata: str = "") -> None:
     try:
-        await asyncio.wait_for(livekit_service.dispatch_agent(room_name), timeout=10.0)
+        await asyncio.wait_for(livekit_service.dispatch_agent(room_name, metadata=metadata), timeout=10.0)
     except asyncio.TimeoutError:
         logger.warning("Agent dispatch timed out for session %s — LiveKit may be unavailable.", session_id)
     except Exception as exc:
@@ -39,24 +42,15 @@ async def _dispatch_agent_and_log(room_name: str, session_id: uuid.UUID) -> None
 
 
 async def _close_room_and_log(room_name: str, session_id: uuid.UUID) -> None:
-    # A room doesn't exist on the LiveKit server until someone actually
-    # connects to it — start_session only mints a token; the room itself
-    # gets created as a side effect of the agent's dispatch (dispatch_agent
-    # has its own ~1.5s+ built-in delay for its liveness check). A session
-    # ended within moments of being started can race that: this first
-    # delete finds nothing (silently succeeds — LiveKit's delete is
-    # idempotent, not an error), and the still-in-flight dispatch then
-    # creates the room *after*, with nothing left to clean it up. A second
-    # pass a few seconds later closes that window without adding real
-    # delay to the common case, which the first attempt already handles.
+    # The room is created lazily by the agent's dispatch, which can still
+    # be in flight when a session ends moments after starting — this first
+    # delete can race it and find nothing. The second pass below, a few
+    # seconds later, closes that window.
     try:
         await asyncio.wait_for(livekit_service.close_room(room_name), timeout=10.0)
     except asyncio.TimeoutError:
         logger.warning("Closing LiveKit room timed out for session %s.", session_id)
     except Exception as exc:
-        # Deleting a room that's already gone (everyone already left
-        # naturally) is an expected, harmless case here — best-effort
-        # cleanup, not a required step.
         logger.info("Could not close LiveKit room for session %s (may already be closed): %s", session_id, exc)
 
     await asyncio.sleep(5.0)
@@ -97,6 +91,33 @@ async def list_sessions(
     ]
 
 
+@router.get("/active", response_model=SessionResponse)
+async def get_active_session(
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    """The caller's current IN_PROGRESS session, if any — at most one can
+    ever exist per user (enforced at the DB level). 404 if none."""
+    result = await db.execute(
+        select(InterviewSession).where(
+            InterviewSession.user_id == uuid.UUID(user_id),
+            InterviewSession.status == SessionStatus.IN_PROGRESS,
+        )
+    )
+    session_obj = result.scalars().first()
+    if not session_obj:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "no_active_session", "message": "No active interview session for this user."},
+        )
+    return SessionResponse(
+        id=str(session_obj.id),
+        user_id=str(session_obj.user_id),
+        room_name=session_obj.room_name,
+        status=session_obj.status.value,
+    )
+
+
 @router.post("/start", response_model=SessionStartResponse, status_code=status.HTTP_201_CREATED)
 async def start_session(
     background_tasks: BackgroundTasks,
@@ -104,26 +125,22 @@ async def start_session(
     user_id: str = Depends(get_current_user_id),
 ):
     try:
-        # JWT "sub" arrives as a plain string — convert to a real UUID object
-        # once, up front, before it touches any UUID-typed column. Comparing
-        # or inserting a raw str against InterviewSession.user_id /
-        # CandidateProfile.user_id / JobDescription.user_id (all UUID columns)
-        # is what was causing the 500s on this endpoint.
+        # JWT "sub" is a plain string — must be a real UUID before it
+        # touches any UUID-typed column.
         user_uuid = uuid.UUID(user_id)
 
-        # Raises the appropriate HTTPException itself if this user isn't
-        # ready to start (incomplete profile, already active, no CV, CV
-        # failed, no job description) — see app/services/session_service.py.
-        await session_service.ensure_ready_to_start(db, user_uuid)
+        # Raises its own HTTPException if the user isn't ready to start
+        # (incomplete profile, already active, no CV, no job description)
+        # — see app/services/session_service.py. Returns the User row so
+        # its name can go straight into the dispatch metadata below.
+        user = await session_service.ensure_ready_to_start(db, user_uuid)
 
         session_id = uuid.uuid4()
         room_name = session_service.build_room_name(session_id)
 
-        # Generate the LiveKit token *before* creating the DB row. If this
-        # were done after the commit and it failed, the session would be
-        # stuck in IN_PROGRESS forever with no valid token ever returned —
-        # and the "session already active" check above would then
-        # permanently block this user from ever starting a new interview.
+        # Token generated before the DB row exists: if this failed after
+        # the commit, the session would be stuck IN_PROGRESS with no valid
+        # token, and the already-active check above would block any retry.
         try:
             livekit_token = livekit_service.generate_token(room_name=room_name, participant_identity=user_id)
         except Exception as exc:
@@ -135,22 +152,19 @@ async def start_session(
 
         new_session = await session_service.create_active_session(db, user_uuid, session_id=session_id)
 
-        # Dispatched only now that the session row is durably committed —
-        # dispatching before commit could hand the agent a room for a
-        # session that then fails to persist (e.g. loses the same-user race
-        # above), leaving it waiting alone in a room nobody will ever join.
-        #
-        # Run as a background task rather than awaited here: dispatch_agent
-        # includes a short liveness check (does a worker actually pick the
-        # job up) that takes a couple of seconds by design — worth the wait
-        # for an accurate log, not worth making the candidate's token
-        # response wait for it. Same "best-effort" spirit as the
-        # report-generation dispatch in end_session: a dispatch problem
-        # (LiveKit unreachable, no worker connected) gets logged loudly,
-        # but doesn't block the candidate from getting their token and
-        # joining the room — automatic server-side dispatch, if configured,
-        # can still pick it up independently.
-        background_tasks.add_task(_dispatch_agent_and_log, room_name, session_id)
+        # Dispatched only after the session row is committed, so a failed
+        # dispatch never leaves the agent waiting in a room tied to a
+        # session that doesn't exist. Run as a background task since
+        # dispatch_agent's liveness check takes a couple of seconds and
+        # shouldn't hold up the candidate's token response — see
+        # app/workers/livekit_agent.py's entrypoint() for how this
+        # metadata is read back.
+        dispatch_metadata = json.dumps({
+            "session_id": str(session_id),
+            "user_id": str(user.id),
+            "user_name": f"{user.first_name} {user.last_name}".strip(),
+        })
+        background_tasks.add_task(_dispatch_agent_and_log, room_name, session_id, dispatch_metadata)
 
         return SessionStartResponse(
             id=str(new_session.id),
@@ -165,11 +179,6 @@ async def start_session(
     except HTTPException:
         raise
     except Exception:
-        # Anything not already turned into a clean HTTPException above
-        # (a bad LiveKit key format, a DB/schema mismatch, ...) — log the
-        # full traceback here, with the user_id this failed for, instead of
-        # letting the client see a bare 500 with no way to trace it back to
-        # a specific request in the server log.
         logger.exception("Unexpected error in POST /sessions/start for user %s", user_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -241,19 +250,13 @@ async def end_session(
     session_obj.status = SessionStatus.COMPLETED
     await db.commit()
 
-    # Tear the LiveKit room down now that the interview is officially
-    # over — otherwise the agent (still running STT/LLM/TTS) can keep
-    # sitting in a room nobody will ever rejoin, on a session that's
-    # already COMPLETED here, until it times out on its own.
+    # Tear the room down now — otherwise the agent keeps sitting in it,
+    # running STT/LLM/TTS, until it times out on its own.
     background_tasks.add_task(_close_room_and_log, session_obj.room_name, session_id)
 
-    # Dispatch Celery task safely — wrap the blocking .delay() call in
-    # asyncio.to_thread so it never blocks the event loop, and impose a
-    # hard 3-second timeout so a dead/slow broker cannot stall the HTTP
-    # response. If dispatch fails for any reason we still return 200 to
-    # the client; the periodic reconciliation task in app.workers.tasks
-    # (reconcile_missing_reports) will pick this session up and retry
-    # the dispatch on its own within a few minutes.
+    # .delay() is blocking — run off the event loop with a hard timeout so
+    # a dead broker can't stall the response. reconcile_missing_reports
+    # (app.workers.tasks) retries this later if dispatch fails here.
     task_id: str | None = None
     try:
         task = await asyncio.wait_for(
@@ -283,10 +286,7 @@ async def get_session_report(
     db: AsyncSession = Depends(get_db),
     user_id: str = Depends(get_current_user_id),
 ):
-    # One round trip instead of two separate SELECTs: the session<->report
-    # relationship is already 1:1 (InterviewReport.session_id is unique),
-    # so eager-loading it here means session_obj.report is populated for
-    # free instead of a second query keyed off session_id.
+    # Eager-load the 1:1 report in the same query instead of a second SELECT.
     session_result = await db.execute(
         select(InterviewSession)
         .options(selectinload(InterviewSession.report))
@@ -326,13 +326,8 @@ async def get_agent_status(
     db: AsyncSession = Depends(get_db),
     user_id: str = Depends(get_current_user_id),
 ):
-    """
-    Live health of the AI interviewer for this session, as last reported
-    by the LiveKit agent process itself (app/workers/livekit_agent.py) —
-    not something this endpoint infers. Lets the app show "Aria is having
-    trouble responding" instead of a candidate sitting in silence with no
-    indication whether that's expected or a failure.
-    """
+    """Live health of the AI interviewer, as last reported by the LiveKit
+    agent process itself (app/workers/livekit_agent.py)."""
     result = await db.execute(select(InterviewSession).where(InterviewSession.id == session_id))
     session_obj = result.scalars().first()
 
@@ -349,4 +344,50 @@ async def get_agent_status(
         status=data.get("status", "unknown"),
         detail=data.get("detail") or None,
         updated_at=data.get("updated_at"),
+    )
+
+
+@router.get("/{session_id}", response_model=InterviewDetailResponse)
+async def get_session_detail(
+    session_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    """Full detail view for one past interview — the history page's
+    "click into an interview" endpoint: metadata, the prepared question
+    list (if any — only the multi-agent pipeline generates one), and the
+    evaluation report once it exists."""
+    result = await db.execute(
+        select(InterviewSession)
+        .options(selectinload(InterviewSession.report))
+        .where(InterviewSession.id == session_id)
+    )
+    session_obj = result.scalars().first()
+
+    if not session_obj:
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Session not found."})
+    if str(session_obj.user_id) != user_id:
+        raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Not your session."})
+
+    report = ReportResponse.model_validate(session_obj.report) if session_obj.report else None
+    transcript = None
+    if report and report.detailed_metrics:
+        transcript = report.detailed_metrics.get("transcript")
+
+    return InterviewDetailResponse(
+        id=str(session_obj.id),
+        user_id=str(session_obj.user_id),
+        room_name=session_obj.room_name,
+        status=session_obj.status.value,
+        created_at=session_obj.created_at,
+        updated_at=session_obj.updated_at,
+        questions=session_obj.questions,
+        candidate_summary=(
+            CandidateSummaryResponse.model_validate(session_obj.candidate_summary)
+            if session_obj.candidate_summary
+            else None
+        ),
+        failure_reason=session_obj.failure_reason,
+        report=report,
+        transcript=transcript,
     )

@@ -1,4 +1,3 @@
-# app/core/providers/openai_provider.py
 """Default STT + LLM provider: OpenAI."""
 from typing import Optional
 

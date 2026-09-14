@@ -1,4 +1,3 @@
-# User Database Model
 import uuid
 from datetime import datetime
 from typing import Optional
@@ -14,10 +13,7 @@ class User(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
-    # Nullable because a Google-only account never sets a password — it
-    # authenticates solely via a verified Google ID token. If that user
-    # later uses "forgot password" this gets populated and both login
-    # paths work from then on.
+    # Null for a Google-only account until it sets a password via "forgot password".
     hashed_password: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     full_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
@@ -36,11 +32,7 @@ class User(Base):
     graduation_year: Mapped[Optional[int]] = mapped_column(nullable=True)
 
     role: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
-    # Google's stable "sub" claim for this user. Unique + nullable: most
-    # rows (password-only accounts) leave it null; a Google-authenticated
-    # account gets it set once, either on first Google sign-in (new user)
-    # or linked onto a pre-existing password account that shares the same
-    # Google-verified email.
+    # Google's stable "sub" claim — null for password-only accounts.
     google_id: Mapped[Optional[str]] = mapped_column(String(255), unique=True, nullable=True, index=True)
     plan: Mapped[str] = mapped_column(String(50), default="Free Plan")
     initials: Mapped[Optional[str]] = mapped_column(String(4), nullable=True)
@@ -80,10 +72,8 @@ class CandidateProfile(Base):
     full_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     raw_cv_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     cv_file_path: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
-    # The name the candidate uploaded the file as (e.g. "Ahmed_CV.pdf") —
-    # separate from cv_file_path, which is the randomized on-disk name
-    # used to avoid collisions. Without this, downloads had no way to
-    # hand the candidate back a recognizable filename.
+    # The candidate's original filename (e.g. "Ahmed_CV.pdf") — separate
+    # from cv_file_path, the randomized on-disk name used to avoid collisions.
     original_filename: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     skills: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)

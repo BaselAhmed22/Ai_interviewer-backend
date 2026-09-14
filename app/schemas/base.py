@@ -13,21 +13,17 @@ class CamelModel(BaseModel):
     )
 
 
-# Everything except \t \n \r — those are legitimate in a multi-line field
-# (a job description). A raw NUL byte in particular isn't just bad input:
-# asyncpg/Postgres reject it outright with CharacterNotInRepertoireError,
-# which (before this) surfaced to the client as a misleading 503
-# "service_unavailable" instead of a 422 telling them what was actually
-# wrong with their request. The rest of the C0 range plus DEL are blocked
-# too as cheap insurance against control-character/log-injection tricks.
+# Everything except \t \n \r, which are legitimate in a multi-line field.
+# A raw NUL in particular makes asyncpg reject the query outright
+# (CharacterNotInRepertoireError), surfacing as a misleading 503 instead
+# of a 422 — the rest of the C0 range plus DEL are blocked as cheap
+# insurance against control-character/log-injection tricks.
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
 class NoControlCharsMixin:
-    # Opt-in (not baked into CamelModel itself) so it only applies to
-    # request schemas carrying free-text user input — response schemas
-    # built from our own trusted data (DB rows, AI-generated summaries)
-    # have no attacker-controlled content to police here.
+    # Opt-in, not baked into CamelModel — only request schemas carry
+    # attacker-controlled input; response schemas built from our own data don't.
     @field_validator("*", mode="before")
     @classmethod
     def _reject_control_characters(cls, value):

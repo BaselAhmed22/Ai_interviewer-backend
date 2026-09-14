@@ -1,81 +1,91 @@
 """
-app/workers/livekit_agent.py
------------------------------
-LiveKit Agent - runs as a SEPARATE PROCESS from the main uvicorn server.
+LiveKit Agent worker — runs as a separate process from the main uvicorn
+server.
 
 Start it with:
     python -m app.workers.livekit_agent start
 
-The agent connects to the LiveKit server, joins every dispatched room,
-listens to the candidate's audio via STT, generates a response via the
-LLM, and speaks it back via TTS. Without an STT/LLM/TTS pipeline
-configured, the agent would join and subscribe to the candidate's audio
-but never publish any audio track of its own — which is exactly what
-produces "camera/mic work, but there's no sound": the human's local
-capture is fine, there is just no second audio track in the room to hear
-anything from.
+Connects to the LiveKit server, joins every dispatched room, and runs
+STT -> LLM -> TTS on the candidate's audio. The pipeline and interviewer
+persona live in app/agents/voice_agent.py (VoiceAgent); this file is the
+process shell around it — connection lifecycle, job metadata, worker
+registration, and the Simli avatar joining alongside VoiceAgent.
 
-The STT/LLM/TTS/VAD pipeline and interviewer persona live in
-app/agents/voice_agent.py (VoiceAgent) — pipeline stage 4 of the
-multi-agent interview pipeline (see app/agents/__init__.py and
-app/services/interview_pipeline.py). This file is the LiveKit worker
-process shell around it: connection lifecycle, job metadata, and worker
-registration.
+Every dispatched job carries a small JSON metadata object (session_id +
+user_id, plus either preparation_id for the multi-agent pipeline or
+user_name for the plain /sessions/start path — see interviews.py /
+sessions.py). Questions and candidate analysis are read from the Redis
+pipeline context first, falling back to the durable copy on the session
+row (InterviewSession.questions / .candidate_summary) if that's expired.
 
-A job dispatched with metadata (the multi-agent pipeline's
-preparation_id — see app.services.interview_pipeline and
-POST /api/v1/interviews/start) briefs VoiceAgent with the CandidateSummary
-and questions DocumentAgent/QuestionnaireAgent already prepared. A job
-with no metadata (e.g. dispatched via the plain POST /sessions/start)
-falls back to VoiceAgent's base persona.
+Voice stack (see app/core/providers/factory.py — swap via .env, not code):
+    STT: Deepgram Nova-3 (monolingual English)
+    LLM: Gemma 4 31B, via LiveKit Inference
+    TTS: Rime, Coda model
 
 Dependencies (already in requirements.txt):
     livekit-agents[deepgram,openai,elevenlabs,silero]~=1.0
+    livekit-plugins-rime
+    livekit-plugins-simli
 
 Required environment variables (this process reads them via os.environ,
 loaded from .env below — it does NOT go through app.core.config.settings
 since it's a separate process from the FastAPI app):
-    OPENAI_API_KEY     - https://platform.openai.com  (STT + LLM)
-    ELEVEN_API_KEY     - https://elevenlabs.io          (TTS)
+    DEEPGRAM_API_KEY   - https://console.deepgram.com  (STT)
+    RIME_API_KEY       - https://rime.ai                (TTS)
+    (Gemma needs no separate key — served through LiveKit Inference,
+    billed to LIVEKIT_API_KEY/LIVEKIT_API_SECRET below.)
+
+Optional — the on-screen avatar (voice-only fallback if unset):
+    SIMLI_API_KEY      - https://app.simli.com/apikey
+    SIMLI_FACE_ID       - https://app.simli.com/create/from-existing
 """
 
 import asyncio
+import json
 import logging
 import os
 import sys
+import uuid
 
 from dotenv import load_dotenv
-
-# Must run before the plugin imports below: livekit-agents plugins read
-# their API keys straight out of os.environ (OPENAI_API_KEY,
-# ELEVEN_API_KEY) at construction time. pydantic-settings in
-# app.core.config only populates its own Settings object from .env — it
-# never touches the real process environment — and this file runs as its
-# own separate process anyway, so nothing else would ever load .env for
-# it.
 load_dotenv()
 
 from livekit.agents import (
+    AgentSession,
     AutoSubscribe,
     JobContext,
     JobExecutorType,
     WorkerOptions,
     cli,
 )
+from livekit.plugins import simli
 
 from app.agents.voice_agent import VoiceAgent
-from app.schemas.agent_context import AgentContext
+from app.schemas.agent_context import AgentContext, CandidateSummary
 from app.services.redis_service import redis_service
 
 logger = logging.getLogger(__name__)
 
-_REQUIRED_ENV_VARS = ("OPENAI_API_KEY", "ELEVEN_API_KEY")
+_REQUIRED_ENV_VARS = ("DEEPGRAM_API_KEY", "RIME_API_KEY")
 
 
-async def _load_pipeline_context(job_metadata: str) -> AgentContext | None:
-    preparation_id = (job_metadata or "").strip()
-    if not preparation_id:
-        return None
+def _parse_job_metadata(job_metadata: str) -> dict:
+    """Both dispatch paths send a small JSON object (see module
+    docstring). Falls back to treating the whole string as a bare
+    preparation_id for any external tooling still using that older,
+    pre-JSON dispatch convention."""
+    job_metadata = (job_metadata or "").strip()
+    if not job_metadata:
+        return {}
+    try:
+        data = json.loads(job_metadata)
+    except json.JSONDecodeError:
+        return {"preparation_id": job_metadata}
+    return data if isinstance(data, dict) else {}
+
+
+async def _load_pipeline_context(preparation_id: str) -> AgentContext | None:
     try:
         raw = await redis_service.get_pipeline_context(preparation_id)
     except Exception as exc:
@@ -89,6 +99,61 @@ async def _load_pipeline_context(job_metadata: str) -> AgentContext | None:
     return AgentContext.model_validate_json(raw)
 
 
+async def _load_persisted_session(session_id: str) -> tuple[list[str], CandidateSummary | None] | None:
+    """Fallback for when the Redis pipeline context has already expired
+    (6h TTL) by the time this job is picked up: reads the durable copy of
+    questions/candidate_summary persisted onto the session row itself at
+    /interviews/start (see app.services.session_service.create_active_session).
+    This process has no FastAPI request to hang a DB session off of, so it
+    opens a short-lived one of its own."""
+    from app.core.database import AsyncSessionLocal
+    from app.db.models.session import InterviewSession
+    from sqlalchemy.future import select
+
+    try:
+        session_uuid = uuid.UUID(session_id)
+    except ValueError:
+        return None
+
+    try:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(InterviewSession).where(InterviewSession.id == session_uuid))
+            session_obj = result.scalars().first()
+    except Exception as exc:
+        logger.error("Failed to load session %s from database: %s", session_id, exc)
+        return None
+
+    if not session_obj:
+        return None
+    summary = CandidateSummary.model_validate(session_obj.candidate_summary) if session_obj.candidate_summary else None
+    return session_obj.questions or [], summary
+
+
+async def _start_avatar(session: AgentSession, room, room_name: str) -> bool:
+    """Joins the Simli avatar as a second room participant, its
+    video/audio synced to the interviewer's TTS output. Best-effort: a
+    candidate can still have a full voice interview without a visible
+    avatar, so a missing key or a Simli-side failure logs a warning and
+    falls back to voice-only instead of failing the whole session."""
+    api_key = os.environ.get("SIMLI_API_KEY")
+    face_id = os.environ.get("SIMLI_FACE_ID")
+    if not api_key or not face_id:
+        logger.warning("SIMLI_API_KEY/SIMLI_FACE_ID not set — continuing voice-only, no avatar.")
+        return False
+
+    try:
+        avatar = simli.AvatarSession(
+            simli_config=simli.SimliConfig(api_key=api_key, face_id=face_id),
+            avatar_participant_identity=f"avatar-{room_name}",
+            avatar_participant_name="Aria (avatar)",
+        )
+        await avatar.start(session, room=room)
+        return True
+    except Exception as exc:
+        logger.error("Simli avatar failed to join room %s — continuing voice-only: %s", room_name, exc)
+        return False
+
+
 async def entrypoint(ctx: JobContext) -> None:
     """
     Entry point for each interview room: connect, load the multi-agent
@@ -99,41 +164,67 @@ async def entrypoint(ctx: JobContext) -> None:
     room_name = ctx.room.name
     logger.info("Agent joining room: %s", room_name)
 
-    # AUDIO_ONLY: this agent never looks at video, so subscribing to it too
-    # would just cost bandwidth/CPU for tracks it never uses.
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
 
-    context = await _load_pipeline_context(ctx.job.metadata)
+    job_info = _parse_job_metadata(ctx.job.metadata)
+    session_id = job_info.get("session_id")
+    preparation_id = job_info.get("preparation_id")
+    candidate_name = job_info.get("user_name")
+    logger.info(
+        "Job metadata: session_id=%s user_id=%s preparation_id=%s",
+        session_id, job_info.get("user_id"), preparation_id,
+    )
+
+    questions: list[str] = []
+    candidate_summary: CandidateSummary | None = None
+
+    if preparation_id:
+        pipeline_context = await _load_pipeline_context(preparation_id)
+        if pipeline_context:
+            questions = pipeline_context.questions
+            candidate_summary = pipeline_context.candidate_summary
+            session_id = session_id or pipeline_context.session_id
+
+    if not questions and session_id:
+        fallback = await _load_persisted_session(session_id)
+        if fallback:
+            questions, db_summary = fallback
+            candidate_summary = candidate_summary or db_summary
+            logger.info("Loaded questions/candidate_summary for session %s from the database.", session_id)
 
     voice_agent = VoiceAgent()
     session = voice_agent.build_session()
 
     @session.on("error")
     def _on_session_error(ev) -> None:
-        # Fires when the STT/LLM/TTS pipeline itself fails (confirmed
-        # live: an exhausted OpenAI quota surfaces here) — previously this
-        # only ever reached the agent process's own log, with the
-        # InterviewSession in the backend's DB staying IN_PROGRESS as if
-        # nothing were wrong and no one aware the AI had gone silent.
-        # session.on callbacks run synchronously, so the Redis write is
-        # scheduled as a task rather than awaited directly.
         detail = str(ev.error)[:500]
         logger.error("AgentSession error in room %s (source=%s): %s", room_name, ev.source, detail)
         asyncio.create_task(redis_service.set_agent_status(room_name, "degraded", detail=detail))
 
-    await session.start(agent=voice_agent.build_agent(room_name, context=context), room=ctx.room)
+    # Must join before session.start(): it hooks into this exact
+    # AgentSession to intercept the TTS audio output and re-publish it
+    # alongside synced avatar video, rather than the session publishing
+    # plain audio on its own.
+    avatar_joined = await _start_avatar(session, ctx.room, room_name)
+    logger.info("Avatar joined room %s: %s", room_name, avatar_joined)
 
-    # The agent can finish connecting and starting faster than the
-    # candidate's own client does (dispatch is near-instant; a phone/app
-    # still has to open, get mic permission, negotiate WebRTC, ...).
-    # Greeting immediately on session start — before checking for this —
-    # risks the one-shot welcome finishing before the candidate has
-    # joined at all, so they arrive to silence having missed it entirely.
+    await session.start(
+        agent=voice_agent.build_agent(
+            room_name, questions=questions, candidate_summary=candidate_summary, candidate_name=candidate_name
+        ),
+        room=ctx.room,
+    )
     participant = await ctx.wait_for_participant()
     logger.info("Candidate detected: %s", participant.identity)
-    await session.generate_reply(
-        instructions="Greet the candidate warmly, introduce yourself as Aria, and ask if they're ready to begin."
-    )
+
+    greeting_name = candidate_name or (candidate_summary.headline if candidate_summary else None)
+    greeting = "Greet the candidate warmly, introduce yourself as Aria, and ask if they're ready to begin."
+    if greeting_name:
+        greeting = (
+            f"Greet {greeting_name} warmly by name, introduce yourself as Aria, "
+            "and ask if they're ready to begin."
+        )
+    await session.generate_reply(instructions=greeting)
 
 
 if __name__ == "__main__":
@@ -141,10 +232,6 @@ if __name__ == "__main__":
 
     missing = [name for name in _REQUIRED_ENV_VARS if not os.environ.get(name)]
     if missing:
-        # Fail loudly and immediately with the exact missing names,
-        # instead of starting the worker and only discovering the gap
-        # deep inside a plugin's constructor the first time a real
-        # interview room tries to use it.
         logger.error(
             "Missing required environment variable(s) for the voice pipeline: %s. "
             "Set them in .env before starting this worker — see the module "
@@ -159,17 +246,7 @@ if __name__ == "__main__":
             api_key=settings.LIVEKIT_API_KEY,
             api_secret=settings.LIVEKIT_API_SECRET,
             ws_url=settings.LIVEKIT_URL,
-            # Required for the backend's explicit dispatch call
-            # (livekit_service.dispatch_agent) to be able to target this
-            # worker by name — without it, this worker only ever receives
-            # LiveKit's automatic per-room dispatch. Must match
-            # settings.LIVEKIT_AGENT_NAME exactly.
             agent_name=settings.LIVEKIT_AGENT_NAME,
-            # Default is THREAD (all concurrent interview jobs share one
-            # process/GIL). PROCESS gives each concurrent session's own
-            # OS process — its own event loop, its own memory, one
-            # session's STT/LLM/TTS load or a crash can't starve or take
-            # down any other candidate's interview.
             job_executor_type=JobExecutorType.PROCESS,
         )
     )

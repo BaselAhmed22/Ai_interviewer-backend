@@ -1,4 +1,3 @@
-# app/agents/evaluation_agent.py
 """
 EvaluationAgent — pipeline stage 5.
 
@@ -9,11 +8,9 @@ POST /api/v1/interviews/evaluate) delegates to — the task owns
 retries/durability/writing to the InterviewReport table, this class
 holds the actual scoring logic.
 
-Placeholder implementation: fixed sample scores — the same placeholder
-data this project's report pipeline has always returned. The AI team
-should replace `evaluate()` with real analysis (of the interview
-transcript and/or recorded audio), keeping the returned dict's keys
-matching app.schemas.report.ReportBase so nothing downstream changes.
+Placeholder implementation: fixed sample scores. Replace `evaluate()`
+with real analysis of the interview transcript/audio, keeping the
+returned dict's keys matching app.schemas.report.ReportBase.
 """
 
 

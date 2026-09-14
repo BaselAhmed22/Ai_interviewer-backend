@@ -1,4 +1,3 @@
-# app/agents/voice_agent.py
 """
 VoiceAgent — pipeline stage 4.
 
@@ -24,7 +23,7 @@ from livekit.agents import Agent, AgentSession
 from livekit.plugins import silero
 
 from app.core.providers.factory import get_llm_provider, get_stt_provider, get_tts_provider
-from app.schemas.agent_context import AgentContext
+from app.schemas.agent_context import CandidateSummary
 from app.services.redis_service import redis_service
 
 logger = logging.getLogger(__name__)
@@ -37,24 +36,31 @@ BASE_INSTRUCTIONS = (
 )
 
 
-def build_instructions(context: AgentContext | None) -> str:
+def build_instructions(
+    questions: list[str] | None = None,
+    candidate_summary: CandidateSummary | None = None,
+    candidate_name: str | None = None,
+) -> str:
     """Combines the base persona with whatever DocumentAgent/
-    QuestionnaireAgent prepared, if a pipeline context is available (see
-    entrypoint() in app/workers/livekit_agent.py — falls back to the bare
-    persona for jobs started without going through
-    POST /api/v1/interviews/prepare, e.g. via /sessions/start)."""
-    if context is None:
-        return BASE_INSTRUCTIONS
-
+    QuestionnaireAgent prepared, if any (see entrypoint() in
+    app/workers/livekit_agent.py — questions/candidate_summary come from
+    either the Redis pipeline context or, if that's expired, the durable
+    copy persisted on the session row). Falls back to just the candidate's
+    name for the plain /sessions/start path (no prepared question list
+    there), or the bare persona if neither is available."""
     parts = [BASE_INSTRUCTIONS]
-    if context.candidate_summary and context.candidate_summary.headline:
-        parts.append(f"The candidate's name is {context.candidate_summary.headline}.")
-    if context.questions:
-        numbered = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(context.questions))
+
+    name = (candidate_summary.headline if candidate_summary else None) or candidate_name
+    if name:
+        parts.append(f"The candidate's name is {name}.")
+
+    if questions:
+        numbered = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(questions))
         parts.append(
             "Guide the conversation through these prepared questions, one at a "
             f"time, adapting naturally to the candidate's answers:\n{numbered}"
         )
+
     return "\n\n".join(parts)
 
 
@@ -93,5 +99,14 @@ class VoiceAgent:
             vad=silero.VAD.load(),
         )
 
-    def build_agent(self, room_name: str, context: AgentContext | None = None) -> InterviewerAgent:
-        return InterviewerAgent(room_name=room_name, instructions=build_instructions(context))
+    def build_agent(
+        self,
+        room_name: str,
+        questions: list[str] | None = None,
+        candidate_summary: CandidateSummary | None = None,
+        candidate_name: str | None = None,
+    ) -> InterviewerAgent:
+        return InterviewerAgent(
+            room_name=room_name,
+            instructions=build_instructions(questions, candidate_summary, candidate_name),
+        )

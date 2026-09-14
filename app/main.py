@@ -15,14 +15,10 @@ from app.core.database import engine
 from app.api.v1.router import api_router
 from app.services.redis_service import redis_service
 
-# Without this, every `logger.info(...)` in this codebase (here and in
-# auth.py, rate_limiter.py, tasks.py, ...) is silently dropped: Python's
-# root logger defaults to WARNING with no handler attached, and uvicorn's
-# own default logging config only sets up its OWN "uvicorn"/"uvicorn.access"
-# loggers — it never touches the root logger our app code uses. Verified:
-# without this call, logger.info() never reaches the terminal at all;
-# only warning/error slip through via Python's WARNING-level "handler of
-# last resort". This must run before any other module's logger is used.
+# Python's root logger defaults to WARNING with no handler attached, and
+# uvicorn's own logging config only sets up its "uvicorn"/"uvicorn.access"
+# loggers — without this, every logger.info() across the app is silently
+# dropped. Must run before any other module's logger is used.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
@@ -33,13 +29,9 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Schema is owned entirely by Alembic (`alembic upgrade head`) — this
-    # used to also run Base.metadata.create_all() here, but running both
-    # let the DB silently drift from the migration history: create_all()
-    # only adds missing tables, it never alters an existing one, so a
-    # model change without a matching migration would fail at query time
-    # instead of at startup, while alembic_version kept claiming the DB
-    # was up to date.
+    # Schema is owned entirely by Alembic (`alembic upgrade head`) — no
+    # create_all() here, since that only adds missing tables and never
+    # alters existing ones, letting the DB silently drift from migrations.
     await redis_service.connect()
     print("Redis connection established.")
 
@@ -67,21 +59,10 @@ _cors_origins = (
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
-    # False is deliberate, not a gap: "credentials" in CORS means
-    # cookies/HTTP basic auth/TLS client certs. This API authenticates
-    # with a bearer token in the Authorization header, which CORS treats
-    # as an ordinary header — already covered by allow_headers=["*"] —
-    # and needs no special credentials flag. Turning this on while
-    # allow_origins is "*" would also be actively wrong: browsers refuse
-    # that combination outright (Access-Control-Allow-Origin: * cannot be
-    # paired with Access-Control-Allow-Credentials: true), so it would
-    # only break requests, not fix them. None of this applies to a native
-    # Android/iOS Flutter build either way — CORS is a browser-only
-    # mechanism, enforced by the browser before it lets JS read a
-    # response; a native HTTP client (Dio/http package on a phone or
-    # emulator) never sends a preflight and never checks these headers at
-    # all, so CORS cannot be the cause of a native app failing to reach
-    # this server — see the host/port note below instead.
+    # False is deliberate: this API authenticates via a bearer token in
+    # the Authorization header, not cookies, so "credentials" don't apply
+    # — and it's incompatible with allow_origins="*" anyway (browsers
+    # reject that combination).
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -90,11 +71,6 @@ app.add_middleware(
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    # Direct, visible proof of whether a request from the Flutter app is
-    # actually arriving at this process at all — the fastest way to tell
-    # "network can't reach the server" (nothing logged) apart from "it
-    # arrived and something went wrong" (logged, then look at the status
-    # code / traceback above).
     started = time.monotonic()
     client_host = request.client.host if request.client else "unknown"
     logger.info("--> %s %s from %s", request.method, request.url.path, client_host)
@@ -112,12 +88,9 @@ async def log_requests(request: Request, call_next):
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    # exc.errors() can embed non-JSON-serializable objects — e.g. a
-    # field_validator that raises ValueError(...) ends up with that
-    # exception instance under ctx.error — which crashes plain json.dumps
-    # with a 500 instead of returning the 422 this handler exists to
-    # produce. jsonable_encoder converts everything to plain JSON types
-    # first (dropping what it can't represent, like the raw exception).
+    # exc.errors() can embed non-JSON-serializable objects (e.g. a raised
+    # exception under ctx.error) — jsonable_encoder strips those instead
+    # of crashing json.dumps with a 500.
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={
@@ -149,14 +122,9 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
-    # Last-resort net: anything that reaches here is either a bug or an
-    # infrastructure outage (Redis/Postgres unreachable) that no
-    # individual endpoint chose to handle specially. A connection-level
-    # failure to a dependency we don't control is a 503, not a 500 — and
-    # is logged with which dependency failed up front, before the full
-    # traceback, so "Postgres is unreachable" vs "Redis is unreachable"
-    # vs "there's a bug" is obvious at a glance in the terminal instead of
-    # having to read the whole stack trace to find the driver error.
+    # Last-resort net: anything reaching here is either a bug or an
+    # infrastructure outage. Log which dependency failed up front, before
+    # the full traceback, and return 503 (not 500) for outages.
     if isinstance(exc, DBAPIError):
         logger.error("Database unreachable or query failed: %s", exc)
     elif isinstance(exc, RedisError):
@@ -187,18 +155,10 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
         )
 
     # This handler runs in Starlette's ServerErrorMiddleware, which sits
-    # OUTSIDE (above) CORSMiddleware — so a response built here never
-    # passes back through CORSMiddleware and would otherwise reach the
-    # browser with no Access-Control-Allow-Origin header at all. A
-    # browser-based client (Flutter web included) then can't read the
-    # response body or status — it just sees an opaque CORS/network
-    # failure, hiding the real 500/503 and message from the app entirely.
-    # Every other exception handler in this file (RequestValidationError,
-    # StarletteHTTPException) runs inside ExceptionMiddleware, which is
-    # nested inside CORSMiddleware, so only this one needs the header
-    # added by hand. Matches this app's actual CORS policy below
-    # (wildcard origin, no credentials) — update both together if that
-    # policy ever changes.
+    # outside CORSMiddleware — unlike every other handler in this file, a
+    # response built here never passes back through CORSMiddleware, so
+    # the header has to be added by hand. Keep this in sync with the CORS
+    # policy above (wildcard origin, no credentials).
     response.headers["Access-Control-Allow-Origin"] = "*"
     return response
 
@@ -212,14 +172,8 @@ app.include_router(api_router, prefix=settings.API_V1_STR)
 
 
 if __name__ == "__main__":
-    # `uvicorn app.main:app --reload` (the command this project's README
-    # documented) binds to 127.0.0.1 by default — reachable only from this
-    # same machine. A phone, emulator, or anything going through ngrok
-    # connects from a different address entirely, so every one of their
-    # requests gets refused at the TCP level before this app ever sees
-    # them (indistinguishable, from the Flutter side, from the server
-    # being down — hence "Unable to reach backend server" with nothing
-    # logged here at all). `python -m app.main` now binds 0.0.0.0 without
+    # `uvicorn app.main:app --reload` binds 127.0.0.1 by default, unreachable
+    # from a phone, emulator, or ngrok tunnel. Binding 0.0.0.0 here avoids
     # depending on anyone remembering the right flags.
     import uvicorn
 

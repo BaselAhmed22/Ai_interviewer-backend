@@ -1,4 +1,3 @@
-# Celery Application Instance
 from celery import Celery
 from app.core.config import settings
 
@@ -16,17 +15,12 @@ celery_app.conf.update(
     timezone="UTC",
     enable_utc=True,
     task_track_started=True,
-    # Without these two, Celery acks a task the moment a worker *picks it
-    # up*, not when it finishes. If the worker process is killed mid-task
-    # (OOM, container restart, manual kill) the task is just gone — it's
-    # never requeued, and max_retries never gets a chance to kick in
-    # because that only fires on an in-task exception, not a lost worker.
+    # Without these, a worker killed mid-task (OOM, restart) loses the
+    # task silently instead of requeuing it — max_retries only fires on an
+    # in-task exception, not a lost worker.
     task_acks_late=True,
     task_reject_on_worker_lost=True,
-    # Safety net for sessions whose end-of-interview report dispatch
-    # failed (broker down at that exact moment, etc) and so never got a
-    # report through the normal path. Requires a `celery beat` process
-    # running alongside the worker: `celery -A app.workers.celery_app beat`.
+    # Requires `celery -A app.workers.celery_app beat` running alongside the worker.
     beat_schedule={
         "reconcile-missing-reports": {
             "task": "reconcile_missing_reports",

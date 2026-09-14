@@ -1,5 +1,5 @@
-# app/schemas/interview_pipeline.py — request/response contracts for the
-# multi-agent pipeline endpoints (app/api/v1/endpoints/interviews.py).
+# Request/response contracts for the multi-agent pipeline endpoints
+# (app/api/v1/endpoints/interviews.py).
 from typing import Optional
 
 from pydantic import Field

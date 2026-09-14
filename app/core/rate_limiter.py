@@ -10,11 +10,9 @@ logger = logging.getLogger(__name__)
 
 
 def get_client_ip(request: Request) -> str:
-    # Behind a reverse proxy or tunnel (Ngrok, Nginx, a load balancer —
-    # this project's own docs mention Ngrok specifically), request.client
-    # is the proxy's socket, not the real caller. Without this, every user
-    # tunneling through the same proxy shares one rate-limit bucket, so one
-    # person's failed logins can lock out everyone else behind it.
+    # Behind a reverse proxy/tunnel, request.client is the proxy's socket,
+    # not the real caller — every user behind it would otherwise share one
+    # rate-limit bucket.
     forwarded_for = request.headers.get("x-forwarded-for")
     if forwarded_for:
         return forwarded_for.split(",")[0].strip()
@@ -25,19 +23,14 @@ def _build_rate_limiter(action: str, max_attempts: int, window_seconds: int):
     async def dependency(request: Request) -> None:
         client_ip = get_client_ip(request)
         key = f"rate-limit:{action}:{client_ip}"
-        # Stashed so the endpoint can clear this IP's counter on success —
-        # otherwise unrelated failed attempts from a shared IP (NAT, office
-        # network) keep counting against a legitimate user's next request.
+        # Stashed so the endpoint can clear this IP's counter on success.
         request.state.rate_limit_key = key
 
         try:
             attempts = await redis_service.increment_counter(key, ttl=window_seconds)
         except RedisError:
-            # Rate limiting is a defense against abuse, not the core
-            # guarantee of these endpoints — a Redis outage must not take
-            # down registration/login/password-reset entirely. Fail open
-            # and let the request through; the real auth checks (password
-            # hash, JWT signature) still apply either way.
+            # Fail open — a Redis outage shouldn't take down auth entirely;
+            # the real checks (password hash, JWT signature) still apply.
             logger.warning("Redis unavailable — allowing request through %s without rate limiting.", action)
             return
 

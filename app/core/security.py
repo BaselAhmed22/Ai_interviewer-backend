@@ -27,11 +27,8 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 
 
 def _base_claims() -> dict:
-    # iss/aud cost nothing to check today (one service, one audience) but
-    # mean a token is only ever valid for *this* backend — if a second
-    # service ever shares SECRET_KEY, a token stolen from one can't be
-    # replayed against the other just because the signature still checks
-    # out.
+    # Scopes a token to this backend — a second service sharing SECRET_KEY
+    # couldn't have a token replayed against it just from a valid signature.
     return {"iss": settings.JWT_ISSUER, "aud": settings.JWT_AUDIENCE}
 
 
@@ -84,9 +81,8 @@ def create_password_reset_token(user_id: str) -> str:
     expire = datetime.now(timezone.utc) + timedelta(
         minutes=settings.PASSWORD_RESET_TOKEN_EXPIRE_MINUTES
     )
-    # A unique jti lets the caller mark this specific token as consumed
-    # (in Redis) after it's used once, so a leaked reset link can't be
-    # replayed for the rest of its validity window.
+    # jti lets the caller mark this specific token consumed in Redis after
+    # first use, so a leaked link can't be replayed.
     payload = {
         **_base_claims(),
         "sub": user_id,
@@ -103,12 +99,9 @@ def decode_password_reset_token(token: str) -> tuple[str, str]:
 
 
 def verify_google_id_token(token: str) -> dict:
-    # verify_oauth2_token does the real work: checks the RS256 signature
-    # against Google's published certs, exp/iat, and — because we pass
-    # GOOGLE_CLIENT_ID — that this token was minted for this app's OAuth
-    # client and not lifted from some other app's Google sign-in. It also
-    # makes a network call (cert fetch, cached) so callers must run this
-    # off the event loop.
+    # Checks signature, exp/iat, and (via GOOGLE_CLIENT_ID) that this token
+    # was minted for this app. Fetches Google's certs over the network, so
+    # callers must run this off the event loop.
     try:
         return google_id_token.verify_oauth2_token(
             token, google_auth_requests.Request(), settings.GOOGLE_CLIENT_ID
@@ -119,10 +112,8 @@ def verify_google_id_token(token: str) -> dict:
             detail={"code": "invalid_google_token", "message": "Google sign-in token is invalid or expired."},
         ) from exc
     except GoogleAuthError as exc:
-        # Raised when verify_oauth2_token can't even reach Google to fetch
-        # its signing certs (network blip, DNS failure, Google outage) —
-        # not a ValueError, so it wasn't caught above and used to escape
-        # as an unhandled 500 instead of a clean, retryable response.
+        # Google itself unreachable (network/DNS/outage) — not a
+        # ValueError, so it needs its own branch to avoid an unhandled 500.
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={"code": "google_unreachable", "message": "Could not reach Google right now. Please try again."},
@@ -130,25 +121,16 @@ def verify_google_id_token(token: str) -> dict:
 
 
 def _is_truthy_flag(value) -> bool:
-    # The id_token path already hands back a real Python bool for
-    # email_verified (parsed from the JWT claim by google-auth). The
-    # REST userinfo endpoint used below is documented to do the same, but
-    # OAuth userinfo responses across providers are inconsistent enough
-    # in practice that treating a stringly "true"/"false" as equivalent
-    # costs nothing and avoids silently treating a verified email as
-    # unverified over a formatting quirk.
+    # OAuth userinfo responses aren't consistent about bool vs string here.
     if isinstance(value, bool):
         return value
     return str(value).lower() == "true"
 
 
 async def verify_google_access_token(access_token: str) -> dict:
-    # Alternate path for clients whose Google Sign-In SDK hands back an
-    # OAuth access token instead of an OIDC id_token (this varies by
-    # platform/SDK version). There's no local signature to check here —
-    # instead this asks Google's own userinfo endpoint "who does this
-    # access token belong to", which only succeeds for a token Google
-    # itself still considers valid, live, and unexpired.
+    # For clients whose SDK returns an OAuth access token rather than an
+    # id_token — no local signature to check, so ask Google's userinfo
+    # endpoint whose token this is.
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             response = await client.get(
@@ -169,9 +151,6 @@ async def verify_google_access_token(access_token: str) -> dict:
 
     data = response.json()
     if not data.get("sub") or not data.get("email"):
-        # Google returned 200 but not the shape a userinfo response
-        # should have — treat it the same as an invalid token rather
-        # than let a KeyError turn this into a 500 further down.
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"code": "invalid_google_token", "message": "Google access token is invalid or expired."},

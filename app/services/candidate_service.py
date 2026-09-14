@@ -1,6 +1,5 @@
-# Small repository-style helper for the "one active record per user"
-# pattern that candidate.py previously repeated inline, identically, for
-# CV profiles, job descriptions, and interview preferences.
+# Shared "one active record per user" pattern used by CV profiles, job
+# descriptions, and interview preferences (see candidate.py).
 import uuid
 from typing import Callable, Type, TypeVar
 

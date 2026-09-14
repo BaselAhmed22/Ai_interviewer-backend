@@ -1,4 +1,3 @@
-# Async Redis Service
 import json
 import time
 import redis.asyncio as aioredis
@@ -57,14 +56,9 @@ class RedisService:
     async def set_agent_status(
         self, room_name: str, status: str, detail: str | None = None, ttl: int = 90
     ) -> None:
-        # Written by the LiveKit agent process (a separate OS process, its
-        # own event loop — see app/workers/livekit_agent.py) so the
-        # backend has *some* visibility into whether the AI side of an
-        # interview is actually working, instead of an IN_PROGRESS session
-        # that silently never gets a response because the LLM/STT/TTS
-        # pipeline is failing. The TTL means a crashed/killed agent process
-        # (no clean on_exit) still reads as stale/unknown after ~90s
-        # instead of "connected" forever.
+        # Written by the separate LiveKit agent process (livekit_agent.py).
+        # TTL means a crashed agent (no clean on_exit) reads as stale after
+        # ~90s instead of "connected" forever.
         await self.connect()
         payload = {"status": status, "detail": detail or "", "updated_at": str(time.time())}
         await self.redis.hset(f"agent-status:{room_name}", mapping=payload)
@@ -76,13 +70,9 @@ class RedisService:
         return data or None
 
     async def save_pipeline_context(self, preparation_id: str, context_json: str, ttl: int = 6 * 3600) -> None:
-        # The working state of one multi-agent interview pipeline run
-        # (see app.schemas.agent_context.AgentContext /
-        # app.services.interview_pipeline.InterviewPipelineManager).
-        # Deliberately ephemeral (6h TTL) — this is scratch state for one
-        # interview attempt, not a durable record; the interview itself
-        # lives in the InterviewSession/InterviewReport tables regardless
-        # of whether this key has expired.
+        # Ephemeral working state for one interview pipeline run (see
+        # app.schemas.agent_context.AgentContext) — the durable record
+        # lives in InterviewSession/InterviewReport regardless of this TTL.
         await self.connect()
         await self.redis.set(f"pipeline-context:{preparation_id}", context_json, ex=ttl)
 

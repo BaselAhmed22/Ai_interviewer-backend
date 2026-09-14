@@ -1,6 +1,7 @@
 from datetime import datetime
 from typing import Optional
 from app.schemas.base import CamelModel, NoControlCharsMixin
+from app.schemas.report import ReportResponse
 
 # --- Session lifecycle schemas ---
 class SessionResponse(CamelModel):
@@ -14,6 +15,35 @@ class SessionListItem(CamelModel):
     room_name: str
     status: str
     created_at: datetime
+
+class CandidateSummaryResponse(CamelModel):
+    """DocumentAgent's CV-vs-job analysis, as persisted onto the session
+    row (see app.schemas.agent_context.CandidateSummary — the internal,
+    non-camelCase version this is read from)."""
+    headline: Optional[str] = None
+    key_skills: list[str] = []
+    experience: list[str] = []
+    projects: list[str] = []
+    required_skills: list[str] = []
+    matching_skills: list[str] = []
+    missing_skills: list[str] = []
+    profile: Optional[str] = None
+
+class InterviewDetailResponse(CamelModel):
+    id: str
+    user_id: str
+    room_name: str
+    status: str
+    created_at: datetime
+    updated_at: datetime
+    questions: Optional[list[str]] = None
+    candidate_summary: Optional[CandidateSummaryResponse] = None
+    failure_reason: Optional[str] = None
+    report: Optional[ReportResponse] = None
+    # Convenience top-level read of report.detailed_metrics["transcript"],
+    # if the evaluation pipeline ever populates one there — null until it
+    # does (no live transcript capture exists yet).
+    transcript: Optional[str] = None
 
 class SessionStartResponse(CamelModel):
     id: str

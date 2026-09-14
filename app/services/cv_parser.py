@@ -21,14 +21,8 @@ class CorruptFileError(Exception):
 
 
 def resolve_cv_path(file_path: str | Path) -> Path:
-    """Resolve a CV path to an absolute location.
-
-    New uploads already store an absolute path (see candidate.py), so this
-    is a no-op for them. It exists to keep working for rows written before
-    that fix — a relative path like "uploads/cvs/x.pdf" stored back then
-    resolves here against BASE_DIR instead of whatever the caller's
-    process working directory happens to be.
-    """
+    """No-op for new uploads (already absolute, see candidate.py); resolves
+    a legacy relative path against BASE_DIR instead of the caller's cwd."""
     path = Path(file_path)
     return path if path.is_absolute() else BASE_DIR / path
 
@@ -50,11 +44,8 @@ def extract_text_from_file(file_path: str) -> str:
                 if extracted:
                     text += extracted + "\n"
         except PyPdfError as exc:
-            # Covers every pypdf failure mode (truncated stream/missing EOF
-            # marker, missing xref table, encrypted-without-password,
-            # empty file, ...) — all mean the same thing to a caller: this
-            # exact file will never parse, no matter how many times it's
-            # retried. Only a fresh re-upload can fix it.
+            # Covers every pypdf failure mode — all non-retryable; only a
+            # fresh re-upload can fix it.
             logger.warning("Corrupt/unreadable PDF at %s: %s", path, exc)
             raise CorruptFileError(
                 f"The PDF file is corrupted or incomplete and could not be read: {exc}"
@@ -63,9 +54,8 @@ def extract_text_from_file(file_path: str) -> str:
         try:
             doc = Document(str(path))
         except (OpcError, BadZipFile) as exc:
-            # python-docx opens .docx as a zip package — a truncated or
-            # otherwise invalid upload fails here the same non-retryable
-            # way a corrupt PDF does.
+            # .docx is a zip package — a truncated upload fails here the
+            # same non-retryable way a corrupt PDF does.
             logger.warning("Corrupt/unreadable DOCX at %s: %s", path, exc)
             raise CorruptFileError(
                 f"The DOCX file is corrupted or incomplete and could not be read: {exc}"

@@ -1,4 +1,3 @@
-# app/core/providers/base.py
 """
 Provider interfaces for the voice pipeline. No STT/LLM/TTS vendor is
 final yet — this layer exists so swapping one (OpenAI for Deepgram,

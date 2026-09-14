@@ -14,11 +14,14 @@ pypdf
 python-docx
 aiofiles
 livekit-agents[deepgram,openai,elevenlabs,silero]~=1.0
+livekit-plugins-rime
+livekit-plugins-simli
 passlib[bcrypt]
 bcrypt<4.1.0
 PyJWT
 alembic
 psycopg2-binary
 google-auth
+google-genai
 requests
 httpx

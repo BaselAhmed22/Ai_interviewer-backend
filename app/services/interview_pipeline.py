@@ -1,21 +1,13 @@
-# app/services/interview_pipeline.py
 """
 InterviewPipelineManager — orchestrates the five-stage agent pipeline:
 
     DocumentAgent -> QuestionnaireAgent -> ControllerAgent -> VoiceAgent -> EvaluationAgent
 
-Two durability layers, not one:
-- Redis (via redis_service.save_pipeline_context/get_pipeline_context):
-  the live AgentContext for one in-flight pipeline run — candidate
-  summary, generated questions, current question index. Ephemeral by
-  design (TTL) — this is working state for one interview attempt, not a
-  permanent record.
-- PostgreSQL (the existing InterviewSession / InterviewReport tables,
-  unchanged by this module): the durable record of the interview itself
-  and its final evaluation.
-
-See app/api/v1/endpoints/interviews.py for how the three pipeline
-endpoints (prepare/start/evaluate) drive this.
+Redis (redis_service.save_pipeline_context) holds the live AgentContext
+for one in-flight run — ephemeral, TTL-bound working state. Once
+/interviews/start creates the InterviewSession row, its questions and
+candidate_summary are also persisted there, so they outlive this Redis
+key. See app/api/v1/endpoints/interviews.py for prepare/start/evaluate.
 """
 import uuid
 from datetime import datetime, timezone
@@ -75,10 +67,10 @@ class InterviewPipelineManager:
                 },
             )
 
-        candidate_summary = document_agent.summarize(
-            raw_cv_text=profile.raw_cv_text, skills=profile.skills, full_name=profile.full_name
+        candidate_summary = await document_agent.summarize(
+            raw_cv_text=profile.raw_cv_text, job_description=job.description_text, full_name=profile.full_name
         )
-        questions = questionnaire_agent.generate(candidate_summary, job.job_title)
+        questions = await questionnaire_agent.generate(candidate_summary, job.job_title)
 
         now = datetime.now(timezone.utc)
         context = AgentContext(
@@ -105,11 +97,10 @@ class InterviewPipelineManager:
         return AgentContext.model_validate_json(raw)
 
     async def mark_started(self, context: AgentContext, session_id: uuid.UUID) -> AgentContext:
-        """Stage 3: hands the prepared context to ControllerAgent — from
-        here, question sequencing is driven by whatever's reading this
-        context next (VoiceAgent, in the LiveKit agent process, receives
-        preparation_id as its job's dispatch metadata and loads this same
-        context back out of Redis — see app/workers/livekit_agent.py)."""
+        """Stage 3: hands the prepared context to ControllerAgent. The
+        LiveKit agent process loads this same context back out of Redis
+        via preparation_id in its job's dispatch metadata (see
+        app/workers/livekit_agent.py)."""
         context.session_id = str(session_id)
         context.stage = PipelineStage.VOICE
         context.updated_at = datetime.now(timezone.utc)

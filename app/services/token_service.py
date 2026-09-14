@@ -1,4 +1,3 @@
-# app/services/token_service.py
 # Refresh-token rotation with token families. A family is every refresh
 # token descended from one login, sharing a family_id; logout and reuse
 # detection both revoke the whole family, not just one token. Only a
@@ -143,10 +142,9 @@ async def rotate_refresh_token(
     if row.status == RefreshTokenStatus.REVOKED:
         grace_deadline = (row.revoked_at or now) + timedelta(seconds=settings.REFRESH_TOKEN_GRACE_PERIOD_SECONDS)
         if now <= grace_deadline:
-            # A second request for this already-rotated token arrived within
-            # the grace window (e.g. two near-simultaneous refresh calls).
-            # Since we never persist raw tokens, the only way to return the
-            # same replacement the first request got is from this cache.
+            # Two near-simultaneous refresh calls — since raw tokens are
+            # never persisted, this cache is the only way to hand the
+            # second request the same replacement the first one got.
             try:
                 cached = await redis_service.get_cached_refresh_rotation(row.token_hash)
             except RedisError:
