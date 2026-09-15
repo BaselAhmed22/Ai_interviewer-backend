@@ -23,9 +23,12 @@ generate_final_interview_report (app/workers/tasks.py) wires these two
 together and flattens the returned EvaluationResult into InterviewReport's
 columns; this module has no knowledge of Postgres writes at all.
 """
+import asyncio
+import difflib
 import json
 import logging
 import os
+import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Optional
@@ -35,6 +38,8 @@ from sqlalchemy.future import select
 
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
+from app.core.redis_service import redis_service
+from app.interviews.agents.gemini_retry import call_with_retry
 from app.interviews.models.session import InterviewSession
 from app.interviews.models.transcript import InterviewTranscript
 from app.candidates.models import JobDescription
@@ -95,17 +100,15 @@ class EvaluationAgent:
         self.model = _MODEL
 
     def _get_client(self) -> genai.Client:
-        # Lazy, like every other Gemini-backed agent in this codebase
-        # (DocumentAgent, QuestionnaireAgent) — evaluation_agent is
-        # instantiated at app/workers/tasks.py's module level, so raising
-        # eagerly here (as the AI team's original __init__ did, reading
-        # os.getenv directly) would crash the whole Celery worker process
-        # at import time if GEMINI_API_KEY is merely unset in this
-        # environment, instead of failing just the one task that needs it.
         if self._client is None:
-            api_key = settings.GEMINI_API_KEY or os.getenv("GEMINI_API_KEY")
+            api_key = (
+                getattr(settings, "GEMINI_EVAL_API_KEY", None)
+                or os.getenv("GEMINI_EVAL_API_KEY")
+                or settings.GEMINI_API_KEY
+                or os.getenv("GEMINI_API_KEY")
+            )
             if not api_key:
-                raise RuntimeError("GEMINI_API_KEY is not set.")
+                raise RuntimeError("Neither GEMINI_EVAL_API_KEY nor GEMINI_API_KEY is set.")
             self._client = genai.Client(api_key=api_key)
         return self._client
 
@@ -117,11 +120,9 @@ class EvaluationAgent:
         questions: list[dict],
         answers: list[dict],
     ) -> EvaluationResult:
-        """Verbatim scoring logic from the AI team: pairs each question
-        (by id) with its matching answer, builds the prompt, and parses
-        Gemini's response — including stripping a ```json fence if the
-        model wraps its output in one, since response_mime_type isn't
-        forced here."""
+        """Evaluates the candidate's interview responses using Gemini.
+        Forces JSON response_mime_type, wraps call in retry logic, and parses output
+        with a robust fallback JSON extractor."""
         interview_data = []
         for question in questions:
             question_id = question["id"]
@@ -140,43 +141,93 @@ class EvaluationAgent:
             interview_data=json.dumps(interview_data, indent=2),
         )
 
-        response = self._get_client().models.generate_content(model=self.model, contents=prompt)
-        raw_text = response.text.strip()
-        if raw_text.startswith("```"):
-            raw_text = raw_text.replace("```json", "").replace("```", "").strip()
-        result = json.loads(raw_text)
+        response = call_with_retry(
+            lambda: self._get_client().models.generate_content(
+                model=self.model,
+                contents=prompt,
+                config={"response_mime_type": "application/json", "temperature": 0.2},
+            )
+        )
+        raw_text = response.text.strip() if response.text else ""
+
+        result = self._parse_json_response(raw_text)
 
         return EvaluationResult(
-            overall_score=float(result["overall_score"]),
-            technical_score=float(result["technical_score"]),
-            problem_solving_score=float(result["problem_solving_score"]),
-            communication_score=float(result["communication_score"]),
+            overall_score=float(result.get("overall_score", 0)),
+            technical_score=float(result.get("technical_score", 0)),
+            problem_solving_score=float(result.get("problem_solving_score", 0)),
+            communication_score=float(result.get("communication_score", 0)),
             strengths=result.get("strengths", []),
             weaknesses=result.get("weaknesses", []),
             recommendation=result.get("recommendation", ""),
             summary=result.get("summary", ""),
         )
 
+    @staticmethod
+    def _parse_json_response(raw_text: str) -> dict:
+        if not raw_text:
+            raise ValueError("Empty response text from Gemini model.")
+
+        # 1. Direct JSON parse
+        try:
+            return json.loads(raw_text)
+        except json.JSONDecodeError:
+            pass
+
+        # 2. Strip code block wrappers
+        cleaned = raw_text.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+            try:
+                return json.loads(cleaned.strip())
+            except json.JSONDecodeError:
+                pass
+
+        # 3. Regex extraction fallback
+        match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0).strip())
+            except json.JSONDecodeError:
+                pass
+
+        raise ValueError(f"Failed to parse valid JSON from Gemini response: {raw_text[:200]}")
+
+
+def _clean_text_for_matching(text: str) -> str:
+    return re.sub(r"[^\w\s]", "", text.lower()).strip()
+
+
+def _is_question_match(q_text: str, turn_text: str) -> bool:
+    q_clean = _clean_text_for_matching(q_text)
+    turn_clean = _clean_text_for_matching(turn_text)
+
+    if not q_clean or not turn_clean:
+        return False
+
+    # 1. Exact or substring containment
+    if q_clean in turn_clean or turn_clean in q_clean:
+        return True
+
+    # 2. Token overlap ratio (portion of question words present in agent turn)
+    q_words = set(q_clean.split())
+    turn_words = set(turn_clean.split())
+    if q_words:
+        overlap = len(q_words & turn_words) / len(q_words)
+        if overlap >= 0.5:
+            return True
+
+    # 3. Fuzzy sequence matcher
+    ratio = difflib.SequenceMatcher(None, q_clean, turn_clean).ratio()
+    return ratio >= 0.5
+
 
 def _pair_questions_and_answers(
     questions: list[dict], turns: list[dict]
 ) -> tuple[list[dict], list[dict]]:
     """Reconstructs (questions_with_id, answers) from InterviewTranscript's
-    chronological turns log ([{speaker: "agent"|"candidate", text, timestamp}, ...]
-    — see app.interviews.services.transcript_service).
-
-    Our prepared questions (InterviewSession.questions) have no stable id
-    of their own, so ids are synthesized as list position. Each question
-    is matched to the AGENT turn that asked it by exact substring
-    containment, not fuzzy text similarity — InterviewerAgent is forced
-    to speak each prepared question verbatim via its get_next_question
-    tool (see app/interviews/agents/voice_agent.py), so this is a
-    reliable match, not a guess. Every CANDIDATE turn between that match
-    and the next matched question's turn is concatenated as the answer;
-    a question the agent never reached (interview cut short) simply gets
-    no answer entry, and EvaluationAgent.evaluate() already defaults that
-    to "" via its own lookup.
-    """
+    chronological turns log using resilient fuzzy matching and token overlap."""
     indexed_questions = [
         {
             "id": i,
@@ -189,36 +240,67 @@ def _pair_questions_and_answers(
 
     match_positions: dict[int, int] = {}
     search_from = 0
+
     for q in indexed_questions:
-        text = q["question"].strip()
-        if not text:
+        q_text = q["question"].strip()
+        if not q_text:
             continue
+
         for idx in range(search_from, len(turns)):
             turn = turns[idx]
-            if turn.get("speaker") == "agent" and text in (turn.get("text") or ""):
-                match_positions[q["id"]] = idx
-                search_from = idx + 1
-                break
+            if turn.get("speaker") == "agent":
+                turn_text = turn.get("text") or ""
+                if _is_question_match(q_text, turn_text):
+                    match_positions[q["id"]] = idx
+                    search_from = idx + 1
+                    break
+
+    # Sequential fallback for unmatched questions
+    agent_turn_indices = [i for i, t in enumerate(turns) if t.get("speaker") == "agent"]
+    if agent_turn_indices:
+        last_matched_idx = -1
+        for q in indexed_questions:
+            qid = q["id"]
+            if qid in match_positions:
+                last_matched_idx = match_positions[qid]
+            else:
+                available = [
+                    idx for idx in agent_turn_indices
+                    if idx > last_matched_idx and idx not in match_positions.values()
+                ]
+                if available:
+                    fallback_idx = available[0]
+                    match_positions[qid] = fallback_idx
+                    last_matched_idx = fallback_idx
 
     ordered_ids = sorted(match_positions, key=lambda qid: match_positions[qid])
     answers = []
-    for pos, qid in enumerate(ordered_ids):
-        start = match_positions[qid] + 1
-        end = match_positions[ordered_ids[pos + 1]] if pos + 1 < len(ordered_ids) else len(turns)
-        answer_text = " ".join(
-            turn["text"] for turn in turns[start:end] if turn.get("speaker") == "candidate"
+
+    if ordered_ids:
+        for pos, qid in enumerate(ordered_ids):
+            start = match_positions[qid] + 1
+            end = match_positions[ordered_ids[pos + 1]] if pos + 1 < len(ordered_ids) else len(turns)
+            answer_text = " ".join(
+                turn["text"] for turn in turns[start:end]
+                if turn.get("speaker") == "candidate" and turn.get("text")
+            ).strip()
+            answers.append({"question_id": qid, "answer": answer_text})
+    else:
+        # Ultimate fallback: concatenate all candidate turns if agent turn pairing completely failed
+        candidate_turns = " ".join(
+            turn["text"] for turn in turns
+            if turn.get("speaker") == "candidate" and turn.get("text")
         ).strip()
-        answers.append({"question_id": qid, "answer": answer_text})
+        for q in indexed_questions:
+            answers.append({"question_id": q["id"], "answer": candidate_turns if q["id"] == 0 else ""})
 
     return indexed_questions, answers
 
 
 async def load_evaluation_inputs(session_id: str) -> tuple[str, dict, str, list[dict], list[dict]]:
-    """Pulls everything EvaluationAgent.evaluate() needs straight from
-    Postgres. Opens its own short-lived DB session: this runs inside a
-    Celery task, which has no request-scoped session to reuse (same
-    reasoning as transcript_service.save_transcript and
-    livekit_agent.py's _load_persisted_session)."""
+    """Pulls session, transcript, and job description for evaluation.
+    Includes Redis live buffer fallback and retry mechanisms to handle race conditions
+    when postgres transcript commit hasn't completed yet."""
     session_uuid = uuid.UUID(session_id)
     async with AsyncSessionLocal() as db:
         result = await db.execute(select(InterviewSession).where(InterviewSession.id == session_uuid))
@@ -231,12 +313,6 @@ async def load_evaluation_inputs(session_id: str) -> tuple[str, dict, str, list[
         )
         transcript_obj = transcript_result.scalars().first()
 
-        # InterviewSession doesn't itself snapshot job description text
-        # (only questions + candidate_summary are persisted at
-        # /interviews/start) — this is the best available source. If the
-        # candidate changed their active job description mid-interview,
-        # this reflects the current one, not necessarily the one the
-        # questions were originally generated against.
         job_result = await db.execute(
             select(JobDescription).where(
                 JobDescription.user_id == session_obj.user_id, JobDescription.is_active.is_(True)
@@ -245,9 +321,39 @@ async def load_evaluation_inputs(session_id: str) -> tuple[str, dict, str, list[
         job = job_result.scalars().first()
 
     turns = transcript_obj.turns if transcript_obj and transcript_obj.turns else []
+
+    # Handle asynchronous race conditions:
+    # If transcript is missing or turns are empty in Postgres, fallback to Redis live turn buffer
+    if not turns and session_obj.room_name:
+        for attempt in range(3):
+            try:
+                redis_turns = await redis_service.get_transcript_turns(session_obj.room_name)
+                if redis_turns:
+                    turns = redis_turns
+                    logger.info(
+                        "Loaded %d turns from Redis fallback for room %s (attempt %d).",
+                        len(turns), session_obj.room_name, attempt + 1
+                    )
+                    break
+            except Exception as redis_exc:
+                logger.warning("Error fetching turns from Redis for room %s: %s", session_obj.room_name, redis_exc)
+
+            if attempt < 2:
+                await asyncio.sleep(1.0)
+                async with AsyncSessionLocal() as db:
+                    t_res = await db.execute(
+                        select(InterviewTranscript).where(InterviewTranscript.session_id == session_uuid)
+                    )
+                    t_obj = t_res.scalars().first()
+                    if t_obj and t_obj.turns:
+                        turns = t_obj.turns
+                        logger.info("Transcript turns found in Postgres on retry attempt %d.", attempt + 2)
+                        break
+
     candidate_analysis = session_obj.candidate_summary or {}
     candidate_name = candidate_analysis.get("headline") or "Candidate"
     job_description = job.description_text if job else ""
 
     questions, answers = _pair_questions_and_answers(session_obj.questions or [], turns)
     return candidate_name, candidate_analysis, job_description, questions, answers
+

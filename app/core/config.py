@@ -115,7 +115,7 @@ class Settings(BaseSettings):
     # run in-process in this app (not the separate LiveKit worker), so this
     # one is read through Settings directly.
     GEMINI_API_KEY: str = ""
-
+    GEMINI_EVAL_API_KEY: str | None = None
     # Comma-separated emails. Registering (password or Google) with one of
     # these is auto-approved and made an admin — the only way to create the
     # first admin, since there's no one to approve them otherwise.

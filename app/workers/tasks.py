@@ -31,33 +31,34 @@ def _backoff_countdown(retries: int, base: float = 10.0) -> float:
 _worker_loop: asyncio.AbstractEventLoop | None = None
 
 
+def get_worker_loop() -> asyncio.AbstractEventLoop:
+    global _worker_loop
+    if _worker_loop is None or _worker_loop.is_closed():
+        _worker_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_worker_loop)
+    return _worker_loop
+
+
 @worker_process_init.connect
 def _init_worker_loop(**kwargs) -> None:
-    global _worker_loop
-    _worker_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(_worker_loop)
+    get_worker_loop()
 
 
 @worker_process_shutdown.connect
 def _shutdown_worker_loop(**kwargs) -> None:
     global _worker_loop
-    if _worker_loop is not None:
-        _worker_loop.run_until_complete(engine.dispose())
+    if _worker_loop is not None and not _worker_loop.is_closed():
+        try:
+            _worker_loop.run_until_complete(engine.dispose())
+        except Exception as exc:
+            logger.warning("Error disposing engine during worker shutdown: %s", exc)
         _worker_loop.close()
         _worker_loop = None
 
 
 def run_async(coro: Coroutine[Any, Any, Any]) -> Any:
-    if _worker_loop is not None:
-        return _worker_loop.run_until_complete(coro)
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.run_until_complete(engine.dispose())
-        loop.close()
+    loop = get_worker_loop()
+    return loop.run_until_complete(coro)
 
 
 async def _report_already_exists(session_id: str) -> bool:

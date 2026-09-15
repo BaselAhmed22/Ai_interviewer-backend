@@ -39,6 +39,9 @@ BASE_INSTRUCTIONS = (
     "tool. Call get_next_question to fetch each question (the first one "
     "included) and ask it exactly as returned, word for word — do not "
     "paraphrase, reorder, or add extra technical questions of your own. "
+    "CRITICAL: Never read out loud, mention, or reference any metadata "
+    "such as difficulty levels (e.g., easy, medium, hard) or categories; "
+    "only read the pure question text itself. "
     "Once the tool reports there are no more questions, thank the "
     "candidate and wrap up the interview."
 )
@@ -107,7 +110,7 @@ class InterviewerAgent(Agent):
             self._next_index, len(self._questions), self._room_name,
         )
         await self._publish_question_changed(question_index, question)
-        return f"[{question.difficulty}] {question.question}"
+        return question.question
 
     async def _publish_question_changed(self, question_index: int, question: GeneratedQuestion) -> None:
         """Notifies the Flutter frontend over LiveKit's data channel that
@@ -139,21 +142,40 @@ class InterviewerAgent(Agent):
         await redis_service.set_agent_status(self._room_name, "connected")
 
     async def on_exit(self) -> None:
-        logger.info("InterviewerAgent exited room.")
-        await redis_service.set_agent_status(self._room_name, "disconnected")
-
-        # Final, durable write of the full conversation — session.history
-        # is the authoritative source (the same object the live
-        # "conversation_item_added" hook mirrors into Redis turn-by-turn
-        # for crash safety; see entrypoint() in app/interviews/workers/livekit_agent.py).
-        if not self._session_id:
-            return
+        logger.info("InterviewerAgent exiting room: %s", self._room_name)
         try:
-            turns = transcript_service.build_turns(self.session.history.messages())
-            await transcript_service.save_transcript(uuid.UUID(self._session_id), turns)
-            logger.info("Saved %d transcript turn(s) for session %s.", len(turns), self._session_id)
-        except Exception as exc:
-            logger.error("Failed to save transcript for session %s: %s", self._session_id, exc)
+            try:
+                await redis_service.set_agent_status(self._room_name, "disconnected")
+            except Exception as status_exc:
+                logger.warning("Failed to set agent status to disconnected for room %s: %s", self._room_name, status_exc)
+        finally:
+            if self._session_id:
+                try:
+                    turns = []
+                    # 1. Try building turns from LiveKit session history
+                    if hasattr(self, "session") and self.session and hasattr(self.session, "history"):
+                        try:
+                            turns = transcript_service.build_turns(self.session.history.messages())
+                        except Exception as build_exc:
+                            logger.warning("Failed to build turns from session history for %s: %s", self._session_id, build_exc)
+
+                    # 2. Fallback to Redis live turn buffer if turns are missing
+                    if not turns and self._room_name:
+                        try:
+                            turns = await redis_service.get_transcript_turns(self._room_name)
+                            if turns:
+                                logger.info("Loaded %d turns from Redis live buffer during on_exit for session %s", len(turns), self._session_id)
+                        except Exception as redis_exc:
+                            logger.warning("Failed to load turns from Redis during on_exit for session %s: %s", self._session_id, redis_exc)
+
+                    # 3. Durable write to PostgreSQL
+                    if turns:
+                        await transcript_service.save_transcript(uuid.UUID(self._session_id), turns)
+                        logger.info("Saved %d transcript turn(s) for session %s.", len(turns), self._session_id)
+                    else:
+                        logger.warning("No transcript turns found in session history or Redis for session %s on exit.", self._session_id)
+                except Exception as exc:
+                    logger.error("Failed to save transcript during on_exit for session %s: %s", self._session_id, exc)
 
 
 class VoiceAgent:

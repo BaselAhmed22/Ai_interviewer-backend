@@ -13,6 +13,7 @@ from app.core.security import get_current_user_id
 from app.core.config import settings
 from app.interviews.models.session import InterviewSession, SessionStatus
 from app.interviews.models.report import InterviewReport
+from app.interviews.models.transcript import InterviewTranscript
 from app.workers.tasks import generate_final_interview_report
 from app.interviews.services import transcript_service
 from app.interviews.services.livekit_service import livekit_service
@@ -183,6 +184,24 @@ async def end_session(
     session_obj.status = SessionStatus.COMPLETED
     await db.commit()
 
+    # Explicit Transcript Sync: If InterviewTranscript is missing or empty in DB, sync from Redis live buffer
+    t_result = await db.execute(select(InterviewTranscript).where(InterviewTranscript.session_id == session_id))
+    transcript_row = t_result.scalars().first()
+    if not transcript_row or not transcript_row.turns:
+        if session_obj.room_name:
+            try:
+                redis_turns = await redis_service.get_transcript_turns(session_obj.room_name)
+                if redis_turns:
+                    if transcript_row:
+                        transcript_row.turns = redis_turns
+                    else:
+                        transcript_row = InterviewTranscript(session_id=session_id, turns=redis_turns)
+                        db.add(transcript_row)
+                    await db.commit()
+                    logger.info("Explicit transcript sync: persisted %d turns from Redis for session %s on end_session.", len(redis_turns), session_id)
+            except Exception as sync_exc:
+                logger.warning("Explicit transcript sync from Redis failed for session %s: %s", session_id, sync_exc)
+
     # Tear the room down now — otherwise the agent keeps sitting in it,
     # running STT/LLM/TTS, until it times out on its own.
     background_tasks.add_task(_close_room_and_log, session_obj.room_name, session_id)
@@ -317,13 +336,30 @@ async def get_session_transcript(
 
     transcript = await transcript_service.get_transcript(db, session_id)
     if not transcript or not transcript.turns:
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "code": "transcript_not_ready",
-                "message": "Transcript not available yet. It's saved once the interview ends.",
-            },
-        )
+        redis_turns = []
+        if session_obj.room_name:
+            try:
+                redis_turns = await redis_service.get_transcript_turns(session_obj.room_name)
+            except Exception as exc:
+                logger.warning("Failed to fetch transcript turns from Redis for session %s: %s", session_id, exc)
+
+        if redis_turns:
+            if transcript:
+                transcript.turns = redis_turns
+            else:
+                transcript = InterviewTranscript(session_id=session_id, turns=redis_turns)
+                db.add(transcript)
+            await db.commit()
+            await db.refresh(transcript)
+            logger.info("Auto-persisted %d transcript turns from Redis fallback for session %s", len(redis_turns), session_id)
+        else:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "transcript_not_ready",
+                    "message": "Transcript not available yet. It's saved once the interview ends.",
+                },
+            )
 
     return TranscriptResponse(
         session_id=str(session_id),
