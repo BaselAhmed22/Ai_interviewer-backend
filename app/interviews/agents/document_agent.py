@@ -16,6 +16,7 @@ from typing import Optional
 from google import genai
 
 from app.core.config import settings
+from app.interviews.agents.gemini_retry import call_with_retry
 from app.interviews.schemas.agent_context import CandidateSummary
 
 _MODEL = "gemini-3.6-flash" #"gemini-2.5-flash"
@@ -85,11 +86,11 @@ class DocumentAgent:
         return self._client
 
     def _analyze_sync(self, cv_text: str, job_description: str) -> dict:
-        response = self._get_client().models.generate_content(
+        response = call_with_retry(lambda: self._get_client().models.generate_content(
             model=_MODEL,
             contents=_PROMPT_TEMPLATE.format(cv_text=cv_text, job_description=job_description),
             config={"response_mime_type": "application/json", "temperature": 0.1},
-        )
+        ))
         try:
             return json.loads(response.text)
         except json.JSONDecodeError as exc:

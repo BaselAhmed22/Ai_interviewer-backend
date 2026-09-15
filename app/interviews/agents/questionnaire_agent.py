@@ -15,6 +15,7 @@ from typing import Optional
 from google import genai
 
 from app.core.config import settings
+from app.interviews.agents.gemini_retry import call_with_retry
 from app.interviews.schemas.agent_context import CandidateSummary, GeneratedQuestion
 
 _DIFFICULTIES = ("easy", "medium", "hard")
@@ -149,11 +150,11 @@ class QuestionnaireAgent:
         return self._client
 
     def _generate_sync(self, prompt: str, number_of_questions: int) -> list[dict]:
-        response = self._get_client().models.generate_content(
+        response = call_with_retry(lambda: self._get_client().models.generate_content(
             model=_MODEL,
             contents=prompt,
             config={"response_mime_type": "application/json", "temperature": 0.7},
-        )
+        ))
         try:
             result = json.loads(response.text)
         except json.JSONDecodeError as exc:

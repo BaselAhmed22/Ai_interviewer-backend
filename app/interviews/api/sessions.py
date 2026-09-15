@@ -374,7 +374,6 @@ async def get_session_detail(
             if session_obj.candidate_summary
             else None
         ),
-        simli_face_id=session_obj.simli_face_id,
         failure_reason=session_obj.failure_reason,
         report=report,
         transcript=transcript,

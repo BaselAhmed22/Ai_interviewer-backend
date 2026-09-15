@@ -16,8 +16,6 @@ from app.interviews.models.session import InterviewSession, SessionStatus
 from app.interviews.models.report import InterviewReport
 from app.interviews.models.transcript import InterviewTranscript
 from app.interviews.services import transcript_service
-from app.candidates.models import CandidateProfile
-from app.candidates.services.cv_parser import extract_text_from_file, CorruptFileError
 from app.auth.models import RefreshToken
 from app.ai_evaluator.evaluation_agent import EvaluationAgent, load_evaluation_inputs
 from app.core.redis_service import redis_service
@@ -147,56 +145,6 @@ def generate_final_interview_report(self, session_id: str, audio_file_path: str 
 
     logger.info("Report successfully saved to PostgreSQL for session %s", session_id)
     return {"session_id": session_id, **evaluation}
-
-
-@celery_app.task(name="process_cv_analysis", bind=True, max_retries=3)
-def process_cv_analysis(self, profile_id: str):
-    logger.info("Starting CV parsing for profile %s", profile_id)
-
-    async def run_pipeline():
-        async with AsyncSessionLocal() as db:
-            result = await db.execute(
-                select(CandidateProfile).where(CandidateProfile.id == uuid.UUID(profile_id))
-            )
-            profile = result.scalar_one_or_none()
-            if not profile or not profile.cv_file_path:
-                logger.warning("Profile or file path not found for ID: %s", profile_id)
-                return
-
-            raw_text = extract_text_from_file(profile.cv_file_path)
-            profile.raw_cv_text = raw_text
-
-            # TODO: replace with a real skills-extraction AI call
-            profile.skills = "Python, FastAPI, PostgreSQL, Docker, AsyncIO, REST APIs"
-
-            await db.commit()
-            logger.info("CV parsed & analyzed successfully for profile %s", profile_id)
-
-    async def mark_processing_failed(reason: str) -> None:
-        async with AsyncSessionLocal() as db:
-            result = await db.execute(
-                select(CandidateProfile).where(CandidateProfile.id == uuid.UUID(profile_id))
-            )
-            profile = result.scalars().first()
-            if profile:
-                profile.processing_failed = True
-                profile.failure_reason = reason
-                await db.commit()
-
-    try:
-        run_async(run_pipeline())
-    except CorruptFileError as exc:
-        # Corrupt bytes will fail identically on retry — fail immediately
-        # instead of burning 3 retries on the same outcome.
-        logger.warning("CV for profile %s is corrupt — failing without retry: %s", profile_id, exc)
-        run_async(mark_processing_failed(str(exc)))
-        return {"profile_id": profile_id, "corrupt_file": True}
-    except Exception as exc:
-        logger.error("Error parsing CV for profile %s: %s", profile_id, exc)
-        if self.request.retries >= self.max_retries:
-            run_async(mark_processing_failed(str(exc)))
-            raise
-        raise self.retry(exc=exc, countdown=_backoff_countdown(self.request.retries))
 
 
 @celery_app.task(name="reconcile_missing_reports")

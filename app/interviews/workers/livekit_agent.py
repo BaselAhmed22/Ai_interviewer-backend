@@ -138,20 +138,17 @@ async def _load_persisted_session(
     return questions, summary
 
 
-async def _start_avatar(
-    session: AgentSession, room, room_name: str, face_id_override: str | None = None
-) -> bool:
+async def _start_avatar(session: AgentSession, room, room_name: str) -> bool:
     """Joins the Simli avatar as a second room participant, its
     video/audio synced to the interviewer's TTS output. Best-effort: a
     candidate can still have a full voice interview without a visible
     avatar, so a missing key or a Simli-side failure logs a warning and
     falls back to voice-only instead of failing the whole session.
 
-    `face_id_override` is the candidate's chosen/custom Simli face from
-    POST /interviews/prepare (see PrepareInterviewRequest.simli_face_id),
-    taking priority over the worker's own SIMLI_FACE_ID env default."""
+    Always uses the worker's own SIMLI_FACE_ID env default — per-request
+    custom avatar face selection was removed."""
     api_key = os.environ.get("SIMLI_API_KEY")
-    face_id = face_id_override or os.environ.get("SIMLI_FACE_ID")
+    face_id = os.environ.get("SIMLI_FACE_ID")
     if not api_key or not face_id:
         logger.warning("SIMLI_API_KEY/SIMLI_FACE_ID not set — continuing voice-only, no avatar.")
         return False
@@ -185,10 +182,9 @@ async def entrypoint(ctx: JobContext) -> None:
     session_id = job_info.get("session_id")
     preparation_id = job_info.get("preparation_id")
     candidate_name = job_info.get("user_name")
-    simli_face_id = job_info.get("simli_face_id")
     logger.info(
-        "Job metadata: session_id=%s user_id=%s preparation_id=%s simli_face_id=%s",
-        session_id, job_info.get("user_id"), preparation_id, simli_face_id,
+        "Job metadata: session_id=%s user_id=%s preparation_id=%s",
+        session_id, job_info.get("user_id"), preparation_id,
     )
 
     questions: list[GeneratedQuestion] = []
@@ -231,7 +227,7 @@ async def entrypoint(ctx: JobContext) -> None:
     # AgentSession to intercept the TTS audio output and re-publish it
     # alongside synced avatar video, rather than the session publishing
     # plain audio on its own.
-    avatar_joined = await _start_avatar(session, ctx.room, room_name, face_id_override=simli_face_id)
+    avatar_joined = await _start_avatar(session, ctx.room, room_name)
     logger.info("Avatar joined room %s: %s", room_name, avatar_joined)
 
     await session.start(

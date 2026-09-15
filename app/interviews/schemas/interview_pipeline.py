@@ -8,12 +8,19 @@ from app.core.schemas_base import CamelModel, NoControlCharsMixin
 
 
 class PrepareInterviewRequest(NoControlCharsMixin, CamelModel):
-    # Simli avatar face for this interview — a preset id from the app's
-    # picker, or a custom one the candidate uploaded to their own Simli
-    # account. Left as a plain validated string (not an enum) since Simli
-    # face ids are user/account-specific, not a fixed list this backend
-    # owns. Falls back to SIMLI_FACE_ID in the agent's env if omitted.
-    simli_face_id: Optional[str] = Field(default=None, pattern=r"^[A-Za-z0-9_-]{1,128}$")
+    """Fully self-contained: no separate upload-cv/job-description calls
+    needed first. cv_text is plain, already-extracted CV text (a client
+    that has its own PDF/DOCX parsing, or a candidate pasting text
+    directly) — POST /interviews/prepare/upload is the file-upload
+    equivalent of this same endpoint for a raw PDF/DOCX."""
+
+    cv_text: str = Field(min_length=1, max_length=50000)
+    job_title: str = Field(min_length=1, max_length=255)
+    job_description: str = Field(min_length=1, max_length=20000)
+    # Optional: shown on GET /sessions' dashboard cards (companyName) —
+    # see InterviewSession.company_name's docstring. No dedicated
+    # "preferences" step anymore; this is the only place it's captured.
+    company_name: Optional[str] = Field(default=None, max_length=255)
 
     # Bypasses the interview-prep-cache lookup (see
     # interview_pipeline._fingerprint) to force a fresh Gemini call even
@@ -21,6 +28,8 @@ class PrepareInterviewRequest(NoControlCharsMixin, CamelModel):
     # result still overwrites the cache afterward. Defaults to False since
     # almost every caller wants the cache's quota savings.
     force_regenerate: bool = False
+
+    number_of_questions: int = Field(default=5, ge=3, le=10)
 
 
 class PrepareInterviewResponse(CamelModel):

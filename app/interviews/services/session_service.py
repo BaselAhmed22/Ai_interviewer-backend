@@ -108,7 +108,6 @@ async def create_active_session(
     session_id: uuid.UUID | None = None,
     questions: list[dict] | None = None,
     candidate_summary: dict | None = None,
-    simli_face_id: str | None = None,
     job_title: str | None = None,
     company_name: str | None = None,
 ) -> InterviewSession:
@@ -131,7 +130,6 @@ async def create_active_session(
         status=SessionStatus.IN_PROGRESS,
         questions=questions,
         candidate_summary=candidate_summary,
-        simli_face_id=simli_face_id,
         job_title=job_title,
         company_name=company_name,
     )

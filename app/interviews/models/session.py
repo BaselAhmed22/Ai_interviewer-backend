@@ -42,19 +42,15 @@ class InterviewSession(Base):
     # app.interviews.schemas.agent_context.CandidateSummary), persisted so it
     # survives past the Redis pipeline context's TTL. Null, same as `questions`.
     candidate_summary: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
-    # Candidate's chosen (or custom) Simli avatar face, set at
-    # POST /interviews/prepare and carried into the LiveKit agent's
-    # dispatch metadata. Null falls back to SIMLI_FACE_ID in the agent's env.
-    simli_face_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
-    # Snapshotted at POST /interviews/start from the JobDescription /
-    # InterviewPreference active at that moment — same reasoning as
-    # questions/candidate_summary above: a candidate's active job
-    # description or company can change after the fact, and GET /sessions'
-    # dashboard cards (job_position/companyName) need what THIS interview
-    # was actually for, not whatever happens to be active now. Nullable
-    # for historical rows predating this snapshot and because
-    # company_name has no required-preference flow (InterviewPreference
-    # is optional).
+    # Snapshotted at POST /interviews/start from the AgentContext the
+    # prepare step built (job_title from the JobDescription row prepare
+    # created internally, company_name straight from the prepare request
+    # — see PrepareInterviewRequest.company_name) — same reasoning as
+    # questions/candidate_summary above: GET /sessions' dashboard cards
+    # (job_position/companyName) need what THIS interview was actually
+    # for, not whatever the candidate's account happens to hold now.
+    # Nullable for historical rows predating this snapshot, and because
+    # company_name itself is an optional field on the prepare request.
     job_title: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     company_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

@@ -68,9 +68,10 @@ class AgentContext(BaseModel):
     # PrepareInterviewResponse.from_cache.
     from_cache: bool = False
 
-    # Candidate's chosen/custom Simli avatar face for this interview — see
-    # PrepareInterviewRequest.simli_face_id.
-    simli_face_id: Optional[str] = None
+    # Free-text company name captured directly on the prepare request
+    # (see PrepareInterviewRequest.company_name) — snapshotted onto the
+    # session row at /interviews/start for GET /sessions' dashboard cards.
+    company_name: Optional[str] = None
 
     session_id: Optional[str] = None
 

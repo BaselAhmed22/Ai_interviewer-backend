@@ -60,8 +60,9 @@ class InterviewPipelineManager:
         self,
         db: AsyncSession,
         user_uuid: uuid.UUID,
-        simli_face_id: str | None = None,
+        company_name: str | None = None,
         force_regenerate: bool = False,
+        number_of_questions: int = _NUMBER_OF_QUESTIONS,
     ) -> AgentContext:
         """Stage 1-2: DocumentAgent summarizes the candidate's active CV,
         QuestionnaireAgent turns that plus the active job description into
@@ -107,7 +108,7 @@ class InterviewPipelineManager:
             )
 
         fingerprint = _fingerprint(
-            profile.raw_cv_text or "", job.job_title, job.description_text, _NUMBER_OF_QUESTIONS
+            profile.raw_cv_text or "", job.job_title, job.description_text, number_of_questions
         )
 
         cached = None if force_regenerate else await redis_service.get_cached_interview_preparation(fingerprint)
@@ -124,7 +125,7 @@ class InterviewPipelineManager:
             candidate_summary = await document_agent.summarize(
                 raw_cv_text=profile.raw_cv_text, job_description=job.description_text, full_name=profile.full_name
             )
-            questions = await questionnaire_agent.generate(candidate_summary, job.job_title, _NUMBER_OF_QUESTIONS)
+            questions = await questionnaire_agent.generate(candidate_summary, job.job_title, number_of_questions)
             await redis_service.cache_interview_preparation(
                 fingerprint,
                 json.dumps({
@@ -147,7 +148,7 @@ class InterviewPipelineManager:
             stage=PipelineStage.QUESTIONNAIRE,
             candidate_summary=candidate_summary,
             questions=questions,
-            simli_face_id=simli_face_id,
+            company_name=company_name,
             from_cache=from_cache,
             created_at=now,
             updated_at=now,

@@ -67,7 +67,6 @@ class InterviewDetailResponse(CamelModel):
     updated_at: datetime
     questions: Optional[list[GeneratedQuestionResponse]] = None
     candidate_summary: Optional[CandidateSummaryResponse] = None
-    simli_face_id: Optional[str] = None
     failure_reason: Optional[str] = None
     report: Optional[EvaluationReportResponse] = None
     # Convenience top-level read of the full transcript (see
