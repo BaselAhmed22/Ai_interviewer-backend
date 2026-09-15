@@ -63,6 +63,6 @@ class ReportPendingResponse(CamelModel):
     later by app.workers.tasks.reconcile_missing_reports. A UI polling
     this should keep retrying, not treat it as an error."""
 
-    status: str = "pending_evaluation"
+    status: str = "PENDING"
     session_id: str
     message: str = "The interview has ended and the report is being generated. Please check back shortly."

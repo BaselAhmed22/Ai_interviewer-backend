@@ -390,13 +390,21 @@ async def start_interview_pipeline(
 async def evaluate_interview(
     payload: EvaluateInterviewRequest,
     db: AsyncSession = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    user: User = Depends(get_current_active_user),
 ):
-    """Stage 5: EvaluationAgent, dispatched through the same durable,
-    retried Celery path as the automatic evaluation POST
-    /sessions/end/{id} already triggers — safe to call again for a
-    session that already has a report (generate_final_interview_report's
-    own duplicate-dispatch handling is a no-op in that case)."""
+    """Stage 5: Admin-only manual evaluation dispatch.
+
+    Manual evaluation triggers from the frontend are disabled for standard candidate
+    accounts. Evaluations are automatically triggered server-side when a session ends."""
+    if not is_admin(user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "forbidden",
+                "message": "Manual evaluation triggers are disabled for candidate accounts. Evaluations are triggered automatically when an interview ends.",
+            },
+        )
+
     try:
         session_uuid = uuid.UUID(payload.session_id)
     except ValueError:
@@ -406,8 +414,6 @@ async def evaluate_interview(
     session_obj = result.scalars().first()
     if not session_obj:
         raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Session not found."})
-    if str(session_obj.user_id) != user_id:
-        raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Not your session."})
     if session_obj.status != SessionStatus.COMPLETED:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,

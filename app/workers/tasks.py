@@ -85,6 +85,12 @@ async def _mark_session_failed(session_id: str, reason: str) -> None:
 def generate_final_interview_report(self, session_id: str, audio_file_path: str = None):
     logger.info("Starting post-processing for session %s", session_id)
 
+    # Idempotency check: Abort immediately if a report already exists for this session
+    # to avoid redundant Gemini LLM token consumption and duplicate evaluations.
+    if run_async(_report_already_exists(session_id)):
+        logger.info("Report already exists for session %s — skipping evaluation and LLM token usage.", session_id)
+        return {"session_id": session_id, "already_exists": True}
+
     try:
         # Pull session/transcript/job-description from Postgres and pair
         # each prepared question up with the candidate's actual answer
