@@ -18,7 +18,7 @@ from google import genai
 from app.core.config import settings
 from app.interviews.schemas.agent_context import CandidateSummary
 
-_MODEL = "gemini-2.5-flash"
+_MODEL = "gemini-3.6-flash" #"gemini-2.5-flash"
 
 _PROMPT_TEMPLATE = """
 Analyze this candidate CV against this job description.

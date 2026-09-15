@@ -96,4 +96,19 @@ class RedisService:
         raw_items = await self.redis.lrange(f"transcript:{room_name}", 0, -1)
         return [json.loads(item) for item in raw_items]
 
+    async def cache_interview_preparation(self, fingerprint: str, payload_json: str, ttl: int = 24 * 3600) -> None:
+        # Caches DocumentAgent + QuestionnaireAgent's combined Gemini output
+        # (candidate_summary + questions) keyed by a content fingerprint of
+        # the CV/job description that produced it — see
+        # app.interviews.services.interview_pipeline._fingerprint. Same
+        # input text always deserves the same output, so repeated
+        # prepare() calls (test runs, a candidate double-clicking "prepare")
+        # don't re-spend Gemini quota for an identical request.
+        await self.connect()
+        await self.redis.set(f"interview-prep-cache:{fingerprint}", payload_json, ex=ttl)
+
+    async def get_cached_interview_preparation(self, fingerprint: str) -> str | None:
+        await self.connect()
+        return await self.redis.get(f"interview-prep-cache:{fingerprint}")
+
 redis_service = RedisService()

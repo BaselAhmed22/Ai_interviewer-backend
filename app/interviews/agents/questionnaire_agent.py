@@ -19,7 +19,7 @@ from app.interviews.schemas.agent_context import CandidateSummary, GeneratedQues
 
 _DIFFICULTIES = ("easy", "medium", "hard")
 
-_MODEL = "gemini-2.5-flash"
+_MODEL = "gemini-3.6-flash"#"gemini-2.5-flash"
 
 _PROMPT_TEMPLATE = """
 Generate {number_of_questions} technical interview questions

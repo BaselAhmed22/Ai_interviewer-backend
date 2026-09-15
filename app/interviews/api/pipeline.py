@@ -4,18 +4,20 @@ Multi-agent interview pipeline: DocumentAgent -> QuestionnaireAgent
 (evaluate). See app/interviews/agents/ for the five agent modules and
 app/interviews/services/interview_pipeline.py for the orchestrator.
 
-These sit alongside, not instead of, the existing /sessions/* and
-/interview/start endpoints — those remain the simple, single-call path
-with no prepared question list. This pipeline is for clients that want
-the candidate summary and generated questions back (and a place to hand
-them to the voice agent) before the interview starts.
+This is the only supported way to create an interview session — the
+direct, no-prepared-questions POST /sessions/start path was removed once
+every client moved to prepare -> start. /sessions/* (app/interviews/api/sessions.py)
+still owns the lifecycle/read endpoints (end, detail, transcript,
+report) for sessions this pipeline creates.
 """
 import asyncio
 import json
 import logging
+import re
 import uuid
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from google.genai import errors as genai_errors
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
@@ -24,6 +26,7 @@ from app.core.database import get_db
 from app.core.deps import get_current_active_user
 from app.core.security import get_current_user_id
 from app.interviews.models.session import InterviewSession, SessionStatus
+from app.candidates.models import JobDescription, InterviewPreference
 from app.auth.models import User, is_admin
 from app.interviews.services import session_service
 from app.interviews.services.interview_pipeline import interview_pipeline_manager
@@ -56,6 +59,33 @@ _TRIAL_LIMIT_MESSAGE = (
     "please contact b.ahmed22@ieee.org"
 )
 
+_QUOTA_EXCEEDED_MESSAGE = "AI service quota exhausted, please try again later or upgrade plan."
+
+
+def _is_quota_exceeded(exc: genai_errors.ClientError) -> bool:
+    return exc.code == 429 or (exc.status or "").upper() == "RESOURCE_EXHAUSTED"
+
+
+def _retry_after_seconds(exc: genai_errors.ClientError) -> int | None:
+    """Best-effort: Gemini sometimes includes a google.rpc.RetryInfo entry
+    in the error's details with a retryDelay like "20s" — surface it as a
+    standard Retry-After header when present so a well-behaved client
+    backs off instead of hammering the same failing request. Absence of
+    this (free-tier quota errors often omit it) is normal, not a bug."""
+    details = exc.details if isinstance(exc.details, dict) else {}
+    error_body = details.get("error", details)
+    error_details = error_body.get("details", []) if isinstance(error_body, dict) else []
+    if not isinstance(error_details, list):
+        return None
+    for entry in error_details:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("@type", "").endswith("RetryInfo"):
+            match = re.match(r"^(\d+)", str(entry.get("retryDelay", "")))
+            if match:
+                return int(match.group(1))
+    return None
+
 
 @router.post("/prepare", response_model=PrepareInterviewResponse)
 async def prepare_interview(
@@ -74,7 +104,9 @@ async def prepare_interview(
         )
 
     try:
-        context = await interview_pipeline_manager.prepare(db, user.id, simli_face_id=payload.simli_face_id)
+        context = await interview_pipeline_manager.prepare(
+            db, user.id, simli_face_id=payload.simli_face_id, force_regenerate=payload.force_regenerate
+        )
     except HTTPException:
         raise
     except RuntimeError as exc:
@@ -84,6 +116,23 @@ async def prepare_interview(
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={"code": "ai_not_configured", "message": "Interview preparation is not available right now."},
+        )
+    except genai_errors.ClientError as exc:
+        if _is_quota_exceeded(exc):
+            logger.warning("Gemini quota exhausted preparing an interview for user %s: %s", user.id, exc)
+            retry_after = _retry_after_seconds(exc)
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail={"code": "ai_quota_exceeded", "message": _QUOTA_EXCEEDED_MESSAGE},
+                headers={"Retry-After": str(retry_after)} if retry_after else None,
+            )
+        # Some other 4xx from Gemini (bad request, invalid key, ...) —
+        # not the candidate's fault either way, same clean fallback as
+        # the generic branch below.
+        logger.exception("Gemini rejected the request preparing an interview for user %s", user.id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "ai_generation_failed", "message": "Could not prepare the interview. Please try again."},
         )
     except Exception:
         # Gemini unreachable, quota exhausted, or returned something
@@ -104,6 +153,7 @@ async def prepare_interview(
         questions_count=len(context.questions),
         candidate_headline=context.candidate_summary.headline if context.candidate_summary else None,
         remaining_attempts=max(0, settings.FREE_INTERVIEW_ATTEMPTS - user.interview_attempts_used),
+        from_cache=context.from_cache,
     )
 
 
@@ -131,10 +181,9 @@ async def start_interview_pipeline(
     session_id = uuid.uuid4()
     room_name = session_service.build_room_name(session_id)
 
-    # Token generated before the DB row exists — same reasoning as
-    # /sessions/start: a token-generation failure after the row was
-    # already committed would leave the session stuck IN_PROGRESS with no
-    # valid token ever returned.
+    # Token generated before the DB row exists: a token-generation failure
+    # after the row was already committed would leave the session stuck
+    # IN_PROGRESS with no valid token ever returned.
     try:
         livekit_token = livekit_service.generate_token(room_name=room_name, participant_identity=user_id)
     except Exception as exc:
@@ -144,6 +193,21 @@ async def start_interview_pipeline(
             detail={"code": "livekit_unavailable", "message": "Could not start the interview session. Please try again."},
         )
 
+    # Snapshotted onto the session row (not looked up fresh at read time)
+    # so GET /sessions' dashboard cards show what THIS interview was
+    # actually for even after the candidate's active job description or
+    # company changes later — see InterviewSession.job_title's docstring.
+    job_result = await db.execute(
+        select(JobDescription).where(JobDescription.id == uuid.UUID(context.job_description_id))
+    )
+    job = job_result.scalars().first()
+    preference_result = await db.execute(
+        select(InterviewPreference).where(
+            InterviewPreference.user_id == user_uuid, InterviewPreference.is_active.is_(True)
+        )
+    )
+    preference = preference_result.scalars().first()
+
     new_session = await session_service.create_active_session(
         db,
         user_uuid,
@@ -151,6 +215,8 @@ async def start_interview_pipeline(
         questions=[q.model_dump() for q in context.questions],
         candidate_summary=context.candidate_summary.model_dump() if context.candidate_summary else None,
         simli_face_id=context.simli_face_id,
+        job_title=job.job_title if job else None,
+        company_name=preference.company_name if preference else None,
     )
     context = await interview_pipeline_manager.mark_started(context, new_session.id)
 

@@ -109,13 +109,14 @@ async def create_active_session(
     questions: list[dict] | None = None,
     candidate_summary: dict | None = None,
     simli_face_id: str | None = None,
+    job_title: str | None = None,
+    company_name: str | None = None,
 ) -> InterviewSession:
-    """Create and commit a new IN_PROGRESS InterviewSession row. Shared by
-    /sessions/start and /interviews/start so both create sessions
-    identically.
+    """Create and commit a new IN_PROGRESS InterviewSession row for
+    /interviews/start (see app/interviews/api/pipeline.py).
 
     Pass `session_id` when the caller already generated the LiveKit token
-    against that room name before calling this — both callers do this so a
+    against that room name before calling this — the caller does this so a
     failed token generation never leaves a session stuck IN_PROGRESS with
     no valid token. Omit it to let this function generate one.
 
@@ -131,6 +132,8 @@ async def create_active_session(
         questions=questions,
         candidate_summary=candidate_summary,
         simli_face_id=simli_face_id,
+        job_title=job_title,
+        company_name=company_name,
     )
     db.add(new_session)
     try:

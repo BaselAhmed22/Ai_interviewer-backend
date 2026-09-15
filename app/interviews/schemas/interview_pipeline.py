@@ -15,12 +15,23 @@ class PrepareInterviewRequest(NoControlCharsMixin, CamelModel):
     # owns. Falls back to SIMLI_FACE_ID in the agent's env if omitted.
     simli_face_id: Optional[str] = Field(default=None, pattern=r"^[A-Za-z0-9_-]{1,128}$")
 
+    # Bypasses the interview-prep-cache lookup (see
+    # interview_pipeline._fingerprint) to force a fresh Gemini call even
+    # when an identical CV+job fingerprint is already cached. The fresh
+    # result still overwrites the cache afterward. Defaults to False since
+    # almost every caller wants the cache's quota savings.
+    force_regenerate: bool = False
+
 
 class PrepareInterviewResponse(CamelModel):
     preparation_id: str
     questions_count: int
     candidate_headline: Optional[str] = None
     remaining_attempts: int
+    # True if candidate_summary/questions came from interview-prep-cache
+    # instead of a fresh Gemini call — a low-latency signal, not an error
+    # condition; see interview_pipeline.py's module docstring.
+    from_cache: bool = False
 
 
 class StartPipelineRequest(NoControlCharsMixin, CamelModel):

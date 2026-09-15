@@ -62,6 +62,12 @@ class AgentContext(BaseModel):
     questions: list[GeneratedQuestion] = []
     current_question_index: int = 0
 
+    # True when candidate_summary/questions were served from
+    # interview-prep-cache (see interview_pipeline._fingerprint) instead of
+    # spending fresh Gemini calls — surfaced to the client as
+    # PrepareInterviewResponse.from_cache.
+    from_cache: bool = False
+
     # Candidate's chosen/custom Simli avatar face for this interview — see
     # PrepareInterviewRequest.simli_face_id.
     simli_face_id: Optional[str] = None

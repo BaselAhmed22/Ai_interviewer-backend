@@ -17,10 +17,11 @@ placeholders while the AI team finalizes real choices). VoiceAgent itself
 never names a vendor — swapping one is a config change plus, if it's a
 new vendor, one new provider class; nothing here changes either way.
 """
+import json
 import logging
 import uuid
 
-from livekit.agents import Agent, AgentSession
+from livekit.agents import Agent, AgentSession, function_tool
 from livekit.plugins import silero
 
 from app.interviews.providers.factory import get_llm_provider, get_stt_provider, get_tts_provider
@@ -32,50 +33,102 @@ logger = logging.getLogger(__name__)
 
 BASE_INSTRUCTIONS = (
     "You are Aria, a professional and friendly AI interviewer. "
-    "Ask the candidate concise, relevant questions based on their CV and "
-    "the job description, listen carefully to their answers, and follow "
-    "up where appropriate."
+    "Listen carefully to the candidate's answers and follow up naturally, "
+    "but you must NEVER invent your own interview questions — every "
+    "question you ask must come, verbatim, from the get_next_question "
+    "tool. Call get_next_question to fetch each question (the first one "
+    "included) and ask it exactly as returned, word for word — do not "
+    "paraphrase, reorder, or add extra technical questions of your own. "
+    "Once the tool reports there are no more questions, thank the "
+    "candidate and wrap up the interview."
 )
 
 
 def build_instructions(
-    questions: list[GeneratedQuestion] | None = None,
     candidate_summary: CandidateSummary | None = None,
     candidate_name: str | None = None,
 ) -> str:
-    """Combines the base persona with whatever DocumentAgent/
-    QuestionnaireAgent prepared, if any (see entrypoint() in
-    app/interviews/workers/livekit_agent.py — questions/candidate_summary come from
-    either the Redis pipeline context or, if that's expired, the durable
-    copy persisted on the session row). Falls back to just the candidate's
-    name for the plain /sessions/start path (no prepared question list
-    there), or the bare persona if neither is available."""
+    """Combines the base persona with the candidate's name, if known (see
+    entrypoint() in app/interviews/workers/livekit_agent.py — candidate_summary
+    comes from either the Redis pipeline context or, if that's expired, the
+    durable copy persisted on the session row). The prepared questions
+    themselves are deliberately NOT embedded in the prompt text — they are
+    served one at a time through the get_next_question function_tool below
+    so the LLM cannot drift into asking questions of its own invention."""
     parts = [BASE_INSTRUCTIONS]
 
     name = (candidate_summary.headline if candidate_summary else None) or candidate_name
     if name:
         parts.append(f"The candidate's name is {name}.")
 
-    if questions:
-        numbered = "\n".join(f"{i + 1}. [{q.difficulty}] {q.question}" for i, q in enumerate(questions))
-        parts.append(
-            "Guide the conversation through these prepared questions, one at a "
-            "time, adapting naturally to the candidate's answers. Each is tagged "
-            f"with its intended difficulty — pace and follow-ups accordingly:\n{numbered}"
-        )
-
     return "\n\n".join(parts)
 
 
 class InterviewerAgent(Agent):
-    """LiveKit Agent persona — speaks via the pipeline VoiceAgent configures on its session."""
+    """LiveKit Agent persona — speaks via the pipeline VoiceAgent configures on its session.
+
+    Enforces that every question asked comes from `questions` (the exact
+    list DocumentAgent/QuestionnaireAgent prepared via /interviews/prepare)
+    rather than the LLM's own invention: `questions` is never inlined into
+    the prompt text, it's only reachable through the get_next_question
+    function_tool below, which LiveKit auto-registers because it's defined
+    directly on this Agent subclass (see Agent.__init__ -> find_function_tools)."""
 
     def __init__(
-        self, room_name: str, session_id: str | None = None, instructions: str = BASE_INSTRUCTIONS
+        self,
+        room_name: str,
+        session_id: str | None = None,
+        instructions: str = BASE_INSTRUCTIONS,
+        questions: list[GeneratedQuestion] | None = None,
     ) -> None:
         super().__init__(instructions=instructions)
         self._room_name = room_name
         self._session_id = session_id
+        self._questions = questions or []
+        self._next_index = 0
+
+    @function_tool()
+    async def get_next_question(self) -> str:
+        """Fetch the next prepared interview question to ask the candidate,
+        verbatim. Call this once at the start of the interview and again
+        every time you're ready to move on to a new question — never make
+        up a question yourself. Returns the exact question text to ask, or
+        a message telling you there are no more questions once the list is
+        exhausted, at which point you should wrap up the interview."""
+        if self._next_index >= len(self._questions):
+            logger.info("get_next_question: exhausted (%d asked) for room %s.", self._next_index, self._room_name)
+            return "There are no more prepared questions. Thank the candidate and wrap up the interview."
+
+        question = self._questions[self._next_index]
+        question_index = self._next_index
+        self._next_index += 1
+        logger.info(
+            "get_next_question: serving question %d/%d for room %s.",
+            self._next_index, len(self._questions), self._room_name,
+        )
+        await self._publish_question_changed(question_index, question)
+        return f"[{question.difficulty}] {question.question}"
+
+    async def _publish_question_changed(self, question_index: int, question: GeneratedQuestion) -> None:
+        """Notifies the Flutter frontend over LiveKit's data channel that
+        the interviewer has moved to a new question, so its UI can sync
+        (progress bar, current question text) without polling
+        GET /sessions/{id}. Best-effort: a publish failure (room not
+        reachable, data channel hiccup) must never break the interview
+        itself, so this only logs and moves on."""
+        payload = json.dumps({
+            "event": "QUESTION_CHANGED",
+            "question_index": question_index,
+            "total_questions": len(self._questions),
+            "question_text": question.question,
+        })
+        try:
+            room = self.session.room_io.room
+            await room.local_participant.publish_data(
+                payload.encode("utf-8"), reliable=True, topic="interview_state",
+            )
+        except Exception as exc:
+            logger.warning("Failed to publish QUESTION_CHANGED for room %s: %s", self._room_name, exc)
 
     async def on_enter(self) -> None:
         logger.info("InterviewerAgent entered room.")
@@ -129,5 +182,6 @@ class VoiceAgent:
         return InterviewerAgent(
             room_name=room_name,
             session_id=session_id,
-            instructions=build_instructions(questions, candidate_summary, candidate_name),
+            instructions=build_instructions(candidate_summary, candidate_name),
+            questions=questions,
         )

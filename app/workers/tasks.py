@@ -2,7 +2,6 @@ import asyncio
 import logging
 import random
 import uuid
-import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Coroutine
 
@@ -15,10 +14,13 @@ from app.core.config import settings
 from app.core.database import AsyncSessionLocal, engine
 from app.interviews.models.session import InterviewSession, SessionStatus
 from app.interviews.models.report import InterviewReport
+from app.interviews.models.transcript import InterviewTranscript
+from app.interviews.services import transcript_service
 from app.candidates.models import CandidateProfile
 from app.candidates.services.cv_parser import extract_text_from_file, CorruptFileError
 from app.auth.models import RefreshToken
-from app.ai_evaluator.evaluation_agent import EvaluationAgent
+from app.ai_evaluator.evaluation_agent import EvaluationAgent, load_evaluation_inputs
+from app.core.redis_service import redis_service
 
 logger = logging.getLogger(__name__)
 
@@ -83,15 +85,43 @@ async def _mark_session_failed(session_id: str, reason: str) -> None:
 @celery_app.task(name="generate_final_interview_report", bind=True, max_retries=3)
 def generate_final_interview_report(self, session_id: str, audio_file_path: str = None):
     logger.info("Starting post-processing for session %s", session_id)
-    time.sleep(5)  # simulated processing delay ahead of the real scoring pipeline
-    report_metrics = evaluation_agent.evaluate(session_id)
+
+    try:
+        # Pull session/transcript/job-description from Postgres and pair
+        # each prepared question up with the candidate's actual answer
+        # (see evaluation_agent.load_evaluation_inputs /
+        # _pair_questions_and_answers), then run the AI team's scoring
+        # engine against those resolved primitives.
+        candidate_name, candidate_analysis, job_description, questions, answers = run_async(
+            load_evaluation_inputs(session_id)
+        )
+        result = evaluation_agent.evaluate(candidate_name, candidate_analysis, job_description, questions, answers)
+    except Exception as exc:
+        # Transcript/session missing, GEMINI_API_KEY not configured, Gemini
+        # unreachable or quota-exhausted, malformed JSON back — all land
+        # here and get Celery's normal backoff-retry treatment.
+        logger.error("Error evaluating interview for session %s: %s", session_id, exc)
+        if self.request.retries >= self.max_retries:
+            run_async(_mark_session_failed(session_id, str(exc)))
+            raise
+        raise self.retry(exc=exc, countdown=_backoff_countdown(self.request.retries))
+
+    evaluation = result.to_dict()
 
     async def save_to_db():
         async with AsyncSessionLocal() as db:
             report = InterviewReport(
                 id=uuid.uuid4(),
                 session_id=uuid.UUID(session_id),
-                **report_metrics,
+                overall_score=evaluation.get("overall_score"),
+                technical_score=evaluation.get("technical_score"),
+                problem_solving_score=evaluation.get("problem_solving_score"),
+                communication_score=evaluation.get("communication_score"),
+                strengths=evaluation.get("strengths") or [],
+                weaknesses=evaluation.get("weaknesses") or [],
+                recommendation=evaluation.get("recommendation"),
+                summary=evaluation.get("summary"),
+                is_placeholder=False,
             )
             db.add(report)
             await db.commit()
@@ -109,14 +139,14 @@ def generate_final_interview_report(self, session_id: str, audio_file_path: str 
             raise
         raise self.retry(countdown=_backoff_countdown(self.request.retries))
     except Exception as exc:
-        logger.error("Error generating report for session %s: %s", session_id, exc)
+        logger.error("Error saving report for session %s: %s", session_id, exc)
         if self.request.retries >= self.max_retries:
             run_async(_mark_session_failed(session_id, str(exc)))
             raise
         raise self.retry(exc=exc, countdown=_backoff_countdown(self.request.retries))
 
     logger.info("Report successfully saved to PostgreSQL for session %s", session_id)
-    return {"session_id": session_id, **report_metrics}
+    return {"session_id": session_id, **evaluation}
 
 
 @celery_app.task(name="process_cv_analysis", bind=True, max_retries=3)
@@ -195,6 +225,55 @@ def reconcile_missing_reports(stale_after_minutes: int = 10) -> dict:
     return {"reconciled": len(stale_session_ids)}
 
 
+@celery_app.task(name="reconcile_missing_transcripts")
+def reconcile_missing_transcripts(stale_after_minutes: int = 10) -> dict:
+    """Periodic safety net (celery_app.py's beat_schedule): recovers
+    transcripts for terminal sessions (COMPLETED/FAILED) that never got
+    InterviewerAgent.on_exit()'s durable Postgres write — e.g. the LiveKit
+    worker process crashed or was killed mid-interview. Falls back to the
+    live Redis mirror (redis_service.append_transcript_turn, written
+    turn-by-turn as the interview happens); if Redis has nothing either
+    (its TTL already expired, or the crash happened before any turn was
+    captured), the transcript is unrecoverable and is just logged as such
+    rather than retried forever."""
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=stale_after_minutes)
+
+    async def find_stale_sessions() -> list[tuple[str, str]]:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(InterviewSession.id, InterviewSession.room_name).where(
+                    InterviewSession.status.in_([SessionStatus.COMPLETED, SessionStatus.FAILED]),
+                    InterviewSession.updated_at < cutoff,
+                    ~InterviewSession.id.in_(select(InterviewTranscript.session_id)),
+                )
+            )
+            return [(str(row.id), row.room_name) for row in result.all()]
+
+    async def recover_from_redis(session_id: str, room_name: str) -> bool:
+        turns = await redis_service.get_transcript_turns(room_name)
+        if not turns:
+            return False
+        await transcript_service.save_transcript(uuid.UUID(session_id), turns)
+        return True
+
+    stale_sessions = run_async(find_stale_sessions())
+    recovered = 0
+    unrecoverable = 0
+    for session_id, room_name in stale_sessions:
+        if run_async(recover_from_redis(session_id, room_name)):
+            logger.warning("Reconciliation: recovered transcript for session %s from the Redis mirror.", session_id)
+            recovered += 1
+        else:
+            logger.warning(
+                "Reconciliation: no transcript recoverable for session %s — missing from both "
+                "Postgres and the Redis mirror (TTL expired, or the worker crashed before "
+                "capturing any turn).", session_id,
+            )
+            unrecoverable += 1
+
+    return {"recovered": recovered, "unrecoverable": unrecoverable}
+
+
 @celery_app.task(name="fail_stale_sessions")
 def fail_stale_sessions() -> dict:
     """Closes out IN_PROGRESS sessions abandoned for too long (dropped
@@ -239,3 +318,4 @@ def cleanup_expired_refresh_tokens() -> dict:
     if deleted:
         logger.info("Cleaned up %d expired refresh token(s).", deleted)
     return {"deleted": deleted}
+

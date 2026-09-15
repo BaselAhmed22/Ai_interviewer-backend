@@ -11,10 +11,9 @@ persona live in app/interviews/agents/voice_agent.py (VoiceAgent); this file is 
 process shell around it — connection lifecycle, job metadata, worker
 registration, and the Simli avatar joining alongside VoiceAgent.
 
-Every dispatched job carries a small JSON metadata object (session_id +
-user_id, plus either preparation_id for the multi-agent pipeline or
-user_name for the plain /sessions/start path — see interviews.py /
-sessions.py). Questions and candidate analysis are read from the Redis
+Every dispatched job carries a small JSON metadata object (session_id,
+user_id, preparation_id — see app/interviews/api/pipeline.py's
+start_interview_pipeline). Questions and candidate analysis are read from the Redis
 pipeline context first, falling back to the durable copy on the session
 row (InterviewSession.questions / .candidate_summary) if that's expired.
 
@@ -254,6 +253,12 @@ async def entrypoint(ctx: JobContext) -> None:
         greeting = (
             f"Greet {greeting_name} warmly by name, introduce yourself as Aria, "
             "and ask if they're ready to begin."
+        )
+    if questions:
+        greeting += (
+            " Once they confirm they're ready, call the get_next_question tool "
+            "to fetch the first question and ask it verbatim — do not ask a "
+            "question of your own."
         )
     await session.generate_reply(instructions=greeting)
 

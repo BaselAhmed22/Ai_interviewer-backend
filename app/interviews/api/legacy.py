@@ -21,9 +21,9 @@ async def start_interview(
     db: AsyncSession = Depends(get_db),
     user_id: str = Depends(get_current_user_id),
 ):
-    """Join (or rejoin) the LiveKit room for an interview already created
-    via POST /sessions/start. Verifies ownership and that it's still
-    active, then hands back a fresh token for its room."""
+    """Join (or rejoin) the LiveKit room for an interview session already
+    created via POST /interviews/start. Verifies ownership and that it's
+    still active, then hands back a fresh token for its room."""
     try:
         session_uuid = uuid.UUID(payload.interview_id)
     except ValueError:

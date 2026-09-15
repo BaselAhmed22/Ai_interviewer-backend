@@ -8,7 +8,19 @@ for one in-flight run — ephemeral, TTL-bound working state. Once
 /interviews/start creates the InterviewSession row, its questions and
 candidate_summary are also persisted there, so they outlive this Redis
 key. See app/interviews/api/pipeline.py for prepare/start/evaluate.
+
+Stage 1-2's Gemini output (candidate_summary + questions) is additionally
+cached by a content fingerprint of the CV/job description that produced
+it (interview-prep-cache:<fingerprint>, 24h TTL) — see _fingerprint and
+prepare()'s cache check below. Same CV text against the same job
+description always deserves the same analysis, so this turns repeated
+prepare() calls for an unchanged profile (test runs, a candidate
+re-clicking "prepare") from two fresh Gemini calls into a Redis read,
+which is the difference between burning free-tier quota and not.
 """
+import hashlib
+import json
+import logging
 import uuid
 from datetime import datetime, timezone
 
@@ -19,21 +31,46 @@ from sqlalchemy.future import select
 from app.interviews.agents.document_agent import DocumentAgent
 from app.interviews.agents.questionnaire_agent import QuestionnaireAgent
 from app.candidates.models import CandidateProfile, JobDescription
-from app.interviews.schemas.agent_context import AgentContext, PipelineStage
+from app.interviews.schemas.agent_context import AgentContext, CandidateSummary, GeneratedQuestion, PipelineStage
 from app.core.redis_service import redis_service
+
+logger = logging.getLogger(__name__)
 
 document_agent = DocumentAgent()
 questionnaire_agent = QuestionnaireAgent()
 
+_PREP_CACHE_TTL_SECONDS = 24 * 3600
+_NUMBER_OF_QUESTIONS = 5
+
+
+def _fingerprint(cv_text: str, job_title: str, job_description: str, number_of_questions: int) -> str:
+    """Deterministic cache key: the exact inputs that decide DocumentAgent
+    + QuestionnaireAgent's Gemini output. Not scoped to a candidate_id on
+    purpose — two requests with byte-identical CV text and job description
+    (the common case in repeated test runs against the same fixture) will
+    always deserve the identical answer regardless of which account sent
+    it, so sharing the cache across users only saves quota, it never leaks
+    anything a given request didn't already contain itself."""
+    raw = "␟".join([cv_text.strip(), job_title.strip(), job_description.strip(), str(number_of_questions)])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
 
 class InterviewPipelineManager:
     async def prepare(
-        self, db: AsyncSession, user_uuid: uuid.UUID, simli_face_id: str | None = None
+        self,
+        db: AsyncSession,
+        user_uuid: uuid.UUID,
+        simli_face_id: str | None = None,
+        force_regenerate: bool = False,
     ) -> AgentContext:
         """Stage 1-2: DocumentAgent summarizes the candidate's active CV,
         QuestionnaireAgent turns that plus the active job description into
-        a question list. Persists the result as a fresh AgentContext and
-        returns it."""
+        a question list — unless an identical CV+job fingerprint is
+        already cached (see module docstring), in which case both Gemini
+        calls are skipped entirely. `force_regenerate=True` bypasses the
+        cache lookup (used to intentionally get a fresh set), but a
+        freshly generated result still overwrites the cache afterward.
+        Persists the result as a fresh AgentContext and returns it."""
         cv_result = await db.execute(
             select(CandidateProfile).where(
                 CandidateProfile.user_id == user_uuid, CandidateProfile.is_active.is_(True)
@@ -69,10 +106,37 @@ class InterviewPipelineManager:
                 },
             )
 
-        candidate_summary = await document_agent.summarize(
-            raw_cv_text=profile.raw_cv_text, job_description=job.description_text, full_name=profile.full_name
+        fingerprint = _fingerprint(
+            profile.raw_cv_text or "", job.job_title, job.description_text, _NUMBER_OF_QUESTIONS
         )
-        questions = await questionnaire_agent.generate(candidate_summary, job.job_title)
+
+        cached = None if force_regenerate else await redis_service.get_cached_interview_preparation(fingerprint)
+        from_cache = cached is not None
+        if cached:
+            cached_data = json.loads(cached)
+            candidate_summary = CandidateSummary.model_validate(cached_data["candidate_summary"])
+            questions = [GeneratedQuestion.model_validate(q) for q in cached_data["questions"]]
+            logger.info(
+                "Interview preparation cache HIT for fingerprint %s (user %s) — Gemini not called.",
+                fingerprint[:12], user_uuid,
+            )
+        else:
+            candidate_summary = await document_agent.summarize(
+                raw_cv_text=profile.raw_cv_text, job_description=job.description_text, full_name=profile.full_name
+            )
+            questions = await questionnaire_agent.generate(candidate_summary, job.job_title, _NUMBER_OF_QUESTIONS)
+            await redis_service.cache_interview_preparation(
+                fingerprint,
+                json.dumps({
+                    "candidate_summary": candidate_summary.model_dump(mode="json"),
+                    "questions": [q.model_dump(mode="json") for q in questions],
+                }),
+                ttl=_PREP_CACHE_TTL_SECONDS,
+            )
+            logger.info(
+                "Interview preparation cache MISS for fingerprint %s (user %s) — generated via Gemini and cached.",
+                fingerprint[:12], user_uuid,
+            )
 
         now = datetime.now(timezone.utc)
         context = AgentContext(
@@ -84,6 +148,7 @@ class InterviewPipelineManager:
             candidate_summary=candidate_summary,
             questions=questions,
             simli_face_id=simli_face_id,
+            from_cache=from_cache,
             created_at=now,
             updated_at=now,
         )

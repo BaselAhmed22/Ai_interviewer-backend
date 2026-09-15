@@ -26,6 +26,10 @@ celery_app.conf.update(
             "task": "reconcile_missing_reports",
             "schedule": 300.0,  # every 5 minutes
         },
+        "reconcile-missing-transcripts": {
+            "task": "reconcile_missing_transcripts",
+            "schedule": 300.0,  # every 5 minutes
+        },
         "fail-stale-sessions": {
             "task": "fail_stale_sessions",
             "schedule": 600.0,  # every 10 minutes

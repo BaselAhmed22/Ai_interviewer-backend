@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     # Short-lived: a leaked access token can't be revoked before it expires
     # (stateless JWT, signature-only check). Session continuity beyond
     # this is the refresh token's job.
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
     PASSWORD_RESET_TOKEN_EXPIRE_MINUTES: int = 30
 
     # Refresh-token rotation with token families — see

@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Optional
 from pydantic import field_validator
 from app.core.schemas_base import CamelModel, NoControlCharsMixin
-from app.interviews.schemas.report import ReportResponse
+from app.interviews.schemas.report import EvaluationReportResponse
 
 # --- Session lifecycle schemas ---
 class SessionResponse(CamelModel):
@@ -16,6 +16,16 @@ class SessionListItem(CamelModel):
     room_name: str
     status: str
     created_at: datetime
+    # Snapshotted on the session row at /interviews/start (see
+    # InterviewSession.job_title's docstring) — null for sessions that
+    # predate this field, or that never resolved a job/company at start
+    # time. overall_score is null until the report is generated
+    # (COMPLETED with no report yet, IN_PROGRESS, or FAILED) — see
+    # GET /sessions/{id}/report for the full pending/failed distinction;
+    # this list endpoint only needs the number, not the state machine.
+    job_position: Optional[str] = None
+    company_name: Optional[str] = None
+    overall_score: Optional[float] = None
 
 class CandidateSummaryResponse(CamelModel):
     """DocumentAgent's CV-vs-job analysis, as persisted onto the session
@@ -59,7 +69,7 @@ class InterviewDetailResponse(CamelModel):
     candidate_summary: Optional[CandidateSummaryResponse] = None
     simli_face_id: Optional[str] = None
     failure_reason: Optional[str] = None
-    report: Optional[ReportResponse] = None
+    report: Optional[EvaluationReportResponse] = None
     # Convenience top-level read of the full transcript (see
     # app.interviews.services.transcript_service) — null until the interview ends
     # and InterviewerAgent.on_exit() writes it. Use
@@ -79,17 +89,6 @@ class InterviewDetailResponse(CamelModel):
             {"question": item, "category": "General", "difficulty": "medium"} if isinstance(item, str) else item
             for item in value
         ]
-
-class SessionStartResponse(CamelModel):
-    id: str
-    user_id: str
-    room_name: str
-    status: str
-    livekit_token: str
-    livekit_server_url: str
-    interviewer_name: str = "Aria"
-    interviewer_title: str
-    total_questions: int = 5
 
 class EndSessionResponse(CamelModel):
     message: str

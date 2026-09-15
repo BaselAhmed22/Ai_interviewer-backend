@@ -1,8 +1,9 @@
 import asyncio
-import json
 import logging
 import uuid
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
@@ -11,12 +12,12 @@ from app.core.database import get_db
 from app.core.security import get_current_user_id
 from app.core.config import settings
 from app.interviews.models.session import InterviewSession, SessionStatus
+from app.interviews.models.report import InterviewReport
 from app.workers.tasks import generate_final_interview_report
-from app.interviews.services import session_service, transcript_service
+from app.interviews.services import transcript_service
 from app.interviews.services.livekit_service import livekit_service
 from app.core.redis_service import redis_service
 from app.interviews.schemas.session import (
-    SessionStartResponse,
     SessionListItem,
     SessionResponse,
     InterviewDetailResponse,
@@ -28,19 +29,10 @@ from app.interviews.schemas.session import (
     ReconnectTokenResponse,
     AgentStatusResponse,
 )
-from app.interviews.schemas.report import ReportResponse
+from app.interviews.schemas.report import EvaluationReportResponse, ReportPendingResponse
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
-
-
-async def _dispatch_agent_and_log(room_name: str, session_id: uuid.UUID, metadata: str = "") -> None:
-    try:
-        await asyncio.wait_for(livekit_service.dispatch_agent(room_name, metadata=metadata), timeout=10.0)
-    except asyncio.TimeoutError:
-        logger.warning("Agent dispatch timed out for session %s — LiveKit may be unavailable.", session_id)
-    except Exception as exc:
-        logger.error("Agent dispatch failed for session %s: %s", session_id, exc)
 
 
 async def _close_room_and_log(room_name: str, session_id: uuid.UUID) -> None:
@@ -73,14 +65,21 @@ async def list_sessions(
     limit = max(1, min(limit, 100))
     offset = max(0, offset)
 
+    # Single query, no N+1: job_position/companyName are plain columns on
+    # InterviewSession itself (snapshotted at /interviews/start — see
+    # InterviewSession.job_title's docstring), and overall_score comes
+    # from a LEFT OUTER JOIN to interview_reports so a session with no
+    # report yet (still in progress, or completed but not yet scored)
+    # still returns a row, just with overall_score=None instead of
+    # dropping the session from the list entirely.
     result = await db.execute(
-        select(InterviewSession)
+        select(InterviewSession, InterviewReport.overall_score)
+        .outerjoin(InterviewReport, InterviewReport.session_id == InterviewSession.id)
         .where(InterviewSession.user_id == user_uuid)
         .order_by(InterviewSession.created_at.desc())
         .limit(limit)
         .offset(offset)
     )
-    sessions = result.scalars().all()
 
     return [
         SessionListItem(
@@ -88,8 +87,11 @@ async def list_sessions(
             room_name=s.room_name,
             status=s.status.value,
             created_at=s.created_at,
+            job_position=s.job_title,
+            company_name=s.company_name,
+            overall_score=overall_score,
         )
-        for s in sessions
+        for s, overall_score in result.all()
     ]
 
 
@@ -118,77 +120,6 @@ async def get_active_session(
         room_name=session_obj.room_name,
         status=session_obj.status.value,
     )
-
-
-@router.post("/start", response_model=SessionStartResponse, status_code=status.HTTP_201_CREATED)
-async def start_session(
-    background_tasks: BackgroundTasks,
-    db: AsyncSession = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
-):
-    try:
-        # JWT "sub" is a plain string — must be a real UUID before it
-        # touches any UUID-typed column.
-        user_uuid = uuid.UUID(user_id)
-
-        # Raises its own HTTPException if the user isn't ready to start
-        # (incomplete profile, already active, no CV, no job description)
-        # — see app/interviews/services/session_service.py. Returns the User row so
-        # its name can go straight into the dispatch metadata below.
-        user = await session_service.ensure_ready_to_start(db, user_uuid)
-
-        session_id = uuid.uuid4()
-        room_name = session_service.build_room_name(session_id)
-
-        # Token generated before the DB row exists: if this failed after
-        # the commit, the session would be stuck IN_PROGRESS with no valid
-        # token, and the already-active check above would block any retry.
-        try:
-            livekit_token = livekit_service.generate_token(room_name=room_name, participant_identity=user_id)
-        except Exception as exc:
-            logger.error("LiveKit token generation failed for user %s: %s", user_id, exc)
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail={"code": "livekit_unavailable", "message": "Could not start the interview session. Please try again."},
-            )
-
-        new_session = await session_service.create_active_session(db, user_uuid, session_id=session_id)
-
-        # Dispatched only after the session row is committed, so a failed
-        # dispatch never leaves the agent waiting in a room tied to a
-        # session that doesn't exist. Run as a background task since
-        # dispatch_agent's liveness check takes a couple of seconds and
-        # shouldn't hold up the candidate's token response — see
-        # app/interviews/workers/livekit_agent.py's entrypoint() for how this
-        # metadata is read back.
-        dispatch_metadata = json.dumps({
-            "session_id": str(session_id),
-            "user_id": str(user.id),
-            "user_name": f"{user.first_name} {user.last_name}".strip(),
-        })
-        background_tasks.add_task(_dispatch_agent_and_log, room_name, session_id, dispatch_metadata)
-
-        return SessionStartResponse(
-            id=str(new_session.id),
-            user_id=str(new_session.user_id),
-            room_name=new_session.room_name,
-            status=new_session.status.value,
-            livekit_token=livekit_token,
-            livekit_server_url=settings.LIVEKIT_URL,
-            interviewer_title="AI Interview Specialist",
-            total_questions=5,
-        )
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("Unexpected error in POST /sessions/start for user %s", user_id)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "code": "session_start_failed",
-                "message": "Could not start the interview session due to an unexpected server error.",
-            },
-        )
 
 
 @router.post("/{session_id}/reconnect-token", response_model=ReconnectTokenResponse)
@@ -282,7 +213,11 @@ async def end_session(
     )
 
 
-@router.get("/{session_id}/report", response_model=ReportResponse)
+@router.get(
+    "/{session_id}/report",
+    response_model=EvaluationReportResponse,
+    responses={202: {"model": ReportPendingResponse, "description": "Session ended; report still generating."}},
+)
 async def get_session_report(
     session_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
@@ -311,6 +246,18 @@ async def get_session_report(
         )
 
     if not session_obj.report:
+        if session_obj.status == SessionStatus.COMPLETED:
+            # end_session already enqueued generate_final_interview_report
+            # (and reconcile_missing_reports retries it if that dispatch
+            # was lost) — this is normal, brief post-interview lag, not an
+            # error, so the UI shouldn't treat it as a 404. See
+            # ReportPendingResponse's docstring.
+            return JSONResponse(
+                status_code=status.HTTP_202_ACCEPTED,
+                content=jsonable_encoder(ReportPendingResponse(session_id=str(session_id))),
+            )
+        # IN_PROGRESS: the interview hasn't ended yet, so no report was
+        # ever enqueued — genuinely "not found" rather than "pending".
         raise HTTPException(
             status_code=404,
             detail={
@@ -319,7 +266,7 @@ async def get_session_report(
             },
         )
 
-    return ReportResponse.model_validate(session_obj.report)
+    return EvaluationReportResponse.from_report(session_obj.report)
 
 
 @router.get("/{session_id}/agent-status", response_model=AgentStatusResponse)
@@ -407,7 +354,7 @@ async def get_session_detail(
     if str(session_obj.user_id) != user_id:
         raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Not your session."})
 
-    report = ReportResponse.model_validate(session_obj.report) if session_obj.report else None
+    report = EvaluationReportResponse.from_report(session_obj.report) if session_obj.report else None
     transcript = (
         [TranscriptTurnResponse.model_validate(turn) for turn in session_obj.transcript.turns]
         if session_obj.transcript and session_obj.transcript.turns
