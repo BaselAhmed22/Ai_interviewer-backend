@@ -26,15 +26,6 @@ async def ensure_ready_to_start(db: AsyncSession, user_uuid: uuid.UUID) -> User:
                 "message": "Please complete your profile before starting an interview.",
             },
         )
-    settings_row = await system_settings_service.get_settings(db)
-    if settings_row.require_admin_approval and not user.is_approved:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "code": "account_pending_approval",
-                "message": "Your account is pending admin approval. Please check back shortly.",
-            },
-        )
     if not is_profile_complete(user):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

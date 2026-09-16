@@ -145,13 +145,12 @@ def _user_to_response(user: User) -> UserResponse:
 
 
 def _resolve_new_user_role(email: str) -> tuple[Optional[str], bool]:
-    """Bootstrap admins listed in ADMIN_EMAILS register as role="admin",
-    pre-approved — the only way to create the first admin, since there's
-    no one yet to approve them. Everyone else starts unapproved."""
+    """Bootstrap admins listed in ADMIN_EMAILS register with role="admin".
+    All users default to is_approved=True so no approval gate blocks login/interviews."""
     admin_emails = {e.strip().lower() for e in settings.ADMIN_EMAILS.split(",") if e.strip()}
     if email.lower() in admin_emails:
         return "admin", True
-    return None, False
+    return None, True
 
 
 @router.post(

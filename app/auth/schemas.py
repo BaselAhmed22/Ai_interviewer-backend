@@ -202,7 +202,7 @@ class UserResponse(CamelModel):
     is_graduate: Optional[bool] = None
     graduation_year: Optional[int] = None
     is_profile_complete: bool = False
-    is_approved: bool = False
+    is_approved: bool = True
     interview_attempts_remaining: int = 0
 
     account_type: AccountType = AccountType.USER

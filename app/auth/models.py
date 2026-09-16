@@ -73,10 +73,9 @@ class User(Base):
     # foundation for one.
     is_company_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
-    # Every account starts pending — an admin must approve it (see
-    # app/admin/api.py) before it can start interviews, except bootstrap
-    # admins from ADMIN_EMAILS, which register pre-approved.
-    is_approved: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Every account defaults to approved — no manual admin approval gate
+    # required before logging in or starting interviews.
+    is_approved: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     # Successful POST /interviews/prepare calls, capped at
     # settings.FREE_INTERVIEW_ATTEMPTS. Admins are exempt from the cap but
     # this still counts for them, informationally.
